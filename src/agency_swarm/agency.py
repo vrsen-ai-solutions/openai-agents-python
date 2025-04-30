@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
-from agents import Agent as BaseAgent, FunctionTool, RunResult
-from agents.items import MessageOutputItem, UserInputItem
+from agents import Agent as BaseAgent, FunctionTool, RunResult, TResponseInputItem
+from agents.items import MessageOutputItem
 
 from .agent import Agent
-from .thread import ConversationThread
+from .thread import ConversationThread, ThreadManager
 
 if TYPE_CHECKING:
-    from agents import TResponseInputItem
+    pass
 
 # Type alias for agency chart structure
 AgencyChartEntry = Union[Agent, List[Agent]]
@@ -25,36 +26,23 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)  # Basic config for now
 
 
-# --- State Enum ---
-class InteractionState(Enum):
-    INITIALIZING = 1
-    AGENT_TURN = 2
-    ROUTING = 3
-    FINISHED = 4
-    ERROR = 5
-    MAX_STEPS_REACHED = 6
-    # WAITING_FOR_TOOL_OUTPUT = 7 # Add if SDK interaction requires it
-
-
 class Agency:
     """
-    Orchestrates interactions between multiple Agents using a defined communication chart.
-    Manages conversation threads and facilitates message passing.
+    Manages a collection of Agents, sets up communication paths,
+    and provides delegation methods to initiate agent interactions.
+    Does NOT handle runtime orchestration directly.
     """
 
     agents: Dict[str, Agent]  # Agent name -> Agent instance
     chart: AgencyChart
     parsed_chart: Dict[str, List[str]]  # Parsed chart: sender_name -> list[receiver_names]
-    threads: Dict[str, ConversationThread]  # thread_id -> Thread instance
-    interaction_context: Dict[str, Any]  # Added: Temp context during interaction
+    thread_manager: ThreadManager
     shared_instructions: Optional[str] = None
-    # TODO: Add other original Agency Swarm parameters if needed (e.g., shared_files, async_mode, default_settings)
 
     def __init__(
         self,
         agency_chart: AgencyChart,
         shared_instructions_path: Optional[str] = None,
-        # TODO: Add other relevant params from original Agency Swarm (e.g., settings_path)
     ):
         """
         Initializes the Agency.
@@ -64,12 +52,11 @@ class Agency:
                           Example: [agent1, [agent1, agent2]] means agent1 can talk to user
                           and agent1 can send messages to agent2.
             shared_instructions_path: Optional path to a file containing instructions
-                                       to be prepended to all agents' system prompts.
+                                       to be prepended to all agents\' system prompts.
         """
         logger.info("Initializing Agency...")
         self.chart = agency_chart
-        self.threads = {}
-        self.interaction_context = {}  # Initialize interaction context
+        self.thread_manager = ThreadManager()  # Instantiate ThreadManager
 
         # Load shared instructions if provided
         if shared_instructions_path:
@@ -99,6 +86,9 @@ class Agency:
         # --- Setup Communication Tools ---
         self._setup_communication_tools()
 
+        # --- Configure Agents ---
+        self._configure_agents()
+
         # TODO: Implement loading/applying shared files if that parameter is added
         logger.info("Agency initialization complete.")
 
@@ -114,28 +104,39 @@ class Agency:
                 raise TypeError(
                     f"Invalid object in agency_chart: {agent_instance}. Must be an Agent instance."
                 )
-            if agent_instance.name in agents and id(agents[agent_instance.name]) != id(
-                agent_instance
-            ):
+            # Ensure agent has a name before trying to use it as a key
+            agent_name = getattr(agent_instance, "name", None)
+            if not agent_name:
+                raise ValueError(f"Agent instance {agent_instance} must have a 'name' attribute.")
+
+            if agent_name in agents and id(agents[agent_name]) != id(agent_instance):
                 # Allowing same agent instance multiple times is fine, but different instances with same name is error
                 raise ValueError(
-                    f"Duplicate agent name '{agent_instance.name}' found in agency_chart with different instances."
+                    f"Duplicate agent name '{agent_name}' found in agency_chart with different instances."
                 )
-            agents[agent_instance.name] = agent_instance
+            agents[agent_name] = agent_instance
 
         for entry in chart:
             if isinstance(entry, BaseAgent):
                 register_agent(entry)
             elif isinstance(entry, list) and len(entry) == 2:
                 sender, receiver = entry
+                # Ensure agents have names before proceeding
+                sender_name = getattr(sender, "name", None)
+                receiver_name = getattr(receiver, "name", None)
+                if not sender_name or not receiver_name:
+                    raise ValueError(
+                        "Agents in communication pair list must have a 'name' attribute."
+                    )
+
                 register_agent(sender)
                 register_agent(receiver)
 
                 # Add communication path
-                if sender.name not in parsed:
-                    parsed[sender.name] = []
-                if receiver.name not in parsed.get(sender.name, []):
-                    parsed[sender.name].append(receiver.name)
+                if sender_name not in parsed:
+                    parsed[sender_name] = []
+                if receiver_name not in parsed.get(sender_name, []):
+                    parsed[sender_name].append(receiver_name)
             else:
                 raise ValueError(f"Invalid agency_chart entry type: {type(entry)}. Entry: {entry}")
 
@@ -180,40 +181,73 @@ class Agency:
                 # Add the tool to the sender agent if they don't already have it
                 # Need to check by name as instances might differ if called multiple times
                 if not any(
-                    tool.name == SEND_MESSAGE_TOOL_NAME
-                    for tool in sender_agent.tools
-                    if isinstance(tool, FunctionTool)
+                    getattr(tool, "name", None) == SEND_MESSAGE_TOOL_NAME
+                    for tool in getattr(sender_agent, "tools", [])  # Use getattr for safety
                 ):
-                    sender_agent.add_tool(send_message_tool)
-                    logger.info(f"Added SendMessage tool to agent: {sender_name}")
+                    # Assume sender_agent has an add_tool method
+                    if hasattr(sender_agent, "add_tool") and callable(sender_agent.add_tool):
+                        sender_agent.add_tool(send_message_tool)
+                        logger.info(f"Added SendMessage tool to agent: {sender_name}")
+                    else:
+                        logger.warning(f"Agent {sender_name} does not have an add_tool method.")
             else:
                 logger.warning(f"Sender agent '{sender_name}' defined in chart but not registered.")
+
+    def _configure_agents(self) -> None:
+        """Configures individual agents with necessary references from the agency."""
+        logger.info("Configuring agents with agency references...")
+        for agent_name, agent_instance in self.agents.items():
+            # Set reference to the agency instance itself
+            if hasattr(agent_instance, "_set_agency_instance"):
+                agent_instance._set_agency_instance(self)
+            else:
+                logger.warning(f"Agent {agent_name} does not have _set_agency_instance method.")
+
+            # Inject ThreadManager reference
+            if hasattr(agent_instance, "_set_thread_manager") and hasattr(self, "thread_manager"):
+                agent_instance._set_thread_manager(self.thread_manager)
+            elif not hasattr(self, "thread_manager"):
+                # This warning shouldn't trigger now
+                logger.warning(f"Agency does not have a ThreadManager instance to inject.")
+            else:
+                logger.warning(f"Agent {agent_name} does not have _set_thread_manager method.")
+
+            # Determine allowed peers and set them
+            allowed_peers = self.parsed_chart.get(agent_name, [])
+            if hasattr(agent_instance, "_set_agency_peers"):
+                agent_instance._set_agency_peers(allowed_peers)
+                logger.debug(f"Set allowed peers for {agent_name}: {allowed_peers}")
+            else:
+                logger.warning(f"Agent {agent_name} does not have _set_agency_peers method.")
+
+            # TODO: Apply shared instructions?
+            # if self.shared_instructions:
+            #     if agent_instance.instructions:
+            #          agent_instance.instructions = self.shared_instructions + "\\n\\n---\\n\\n" + agent_instance.instructions
+            #     else:
+            #          agent_instance.instructions = self.shared_instructions
+            #     logger.debug(f"Applied shared instructions to agent: {agent_name}")
 
     # --- Thread Management ---
 
     def get_or_create_thread(
         self, thread_id: Optional[str] = None
     ) -> Tuple[str, ConversationThread]:
-        """Gets an existing thread or creates a new one."""
-        if thread_id and thread_id in self.threads:
-            logger.info(f"Retrieving existing thread: {thread_id}")
-            return thread_id, self.threads[thread_id]
-        else:
-            # Create new thread
-            new_thread = ConversationThread()
-            new_id = new_thread.thread_id
-            self.threads[new_id] = new_thread
-            logger.info(f"Created new thread: {new_id}")
-            return new_id, new_thread
+        """Gets an existing thread or creates a new one using ThreadManager."""
+        # Delegate to ThreadManager
+        thread = self.thread_manager.get_thread(thread_id)
+        logger.info(f"Retrieved thread {thread.thread_id} via ThreadManager.")
+        return thread.thread_id, thread
 
     def delete_thread(self, thread_id: str) -> bool:
-        """Deletes a conversation thread."""
-        if thread_id in self.threads:
-            del self.threads[thread_id]
+        """Deletes a conversation thread using ThreadManager."""
+        # Delegate deletion to ThreadManager
+        deleted = self.thread_manager.delete_thread(thread_id)
+        if deleted:
             logger.info(f"Deleted thread: {thread_id}")
-            return True
-        logger.warning(f"Thread not found for deletion: {thread_id}")
-        return False
+        else:
+            logger.warning(f"Thread not found for deletion: {thread_id}")
+        return deleted
 
     # --- Communication Check ---
 
@@ -221,261 +255,155 @@ class Agency:
         """Checks if communication is allowed based on the parsed chart."""
         return recipient_name in self.parsed_chart.get(sender_name, [])
 
-    # --- Orchestration Methods (Implementing 14.1 & 14.2) ---
+    # --- Orchestration Methods ---
 
-    def _parse_send_message_call(self, run_result: RunResult) -> Optional[Tuple[str, str]]:
-        """Parses the first SendMessage tool call from a RunResult."""
-        if not run_result.tool_calls:
-            return None
-
-        for tool_call in run_result.tool_calls:
-            if tool_call.name == SEND_MESSAGE_TOOL_NAME:
-                try:
-                    # Assuming args_json is a dict after SDK parsing
-                    args = tool_call.args_json
-                    recipient = args.get("recipient")
-                    message = args.get("message")
-                    if recipient and message:
-                        logger.debug(
-                            f"Parsed SendMessage call: to {recipient}, message: '{message[:50]}...'"
-                        )
-                        return recipient, message
-                    else:
-                        logger.warning(
-                            f"SendMessage tool call missing recipient or message: {args}"
-                        )
-                        return None  # Malformed call
-                except Exception as e:
-                    logger.error(
-                        f"Error parsing SendMessage tool call arguments: {tool_call.args_raw}. Error: {e}",
-                        exc_info=True,
-                    )
-                    return None  # Error during parsing
-
-        return None  # No SendMessage tool call found
-
-    async def _execute_agent_turn(
-        self, agent: Agent, thread: ConversationThread, current_interaction_context: Dict[str, Any]
-    ) -> RunResult:
-        """Internal method to execute one turn of an agent using the agents SDK runner."""
-        history = thread.get_history()  # Assuming get_history returns format suitable for run_sync
-        logger.info(f"Executing turn for agent: {agent.name} in thread {thread.thread_id}")
-        # TODO: Add shared instructions to agent if applicable before run?
-        # Note: The base agents.Agent handles prepending instructions, ensure it's done correctly.
-
-        try:
-            # Assuming agency_swarm.Agent inherits from agents.Agent and has run_sync
-            # The base SDK's run_sync should handle tool calls internally
-            result: RunResult = await agent.run_sync(history)  # Use await for async run_sync
-            logger.info(f"Agent {agent.name} completed turn. Result type: {type(result)}")
-
-            # Log tool calls if any
-            if result.tool_calls:
-                logger.info(
-                    f"Agent {agent.name} made tool calls: {[tc.name for tc in result.tool_calls]}"
-                )
-            else:
-                logger.debug(f"Agent {agent.name} made no tool calls.")
-
-            thread.add_run_result(result)  # Add the full RunResult to the thread
-            return result
-        except Exception as e:
-            logger.error(f"Error during agent {agent.name} execution: {e}", exc_info=True)
-            # TODO: Consider how errors should be propagated or handled (Subtask 14.5)
-            raise  # Re-raise for now
-
-    async def run_interaction(
+    async def get_response(
         self,
-        initial_agent: Union[str, Agent],
-        message: TResponseInputItem,
+        message: str,
+        recipient_agent: Union[str, Agent],
         thread_id: Optional[str] = None,
-        max_steps: int = 25,
-    ) -> RunResult:
+        text_only: bool = False,
+        **kwargs: Any,
+    ) -> Union[str, RunResult]:
         """
-        Runs a multi-agent interaction sequence based on the agency chart,
-        tracking the interaction state.
+        Initiates an interaction by sending a message to the specified agent.
+        Delegates the actual execution and orchestration to the agent's get_response method.
 
         Args:
-            initial_agent: The agent (instance or name) to start the interaction.
-            message: The initial message or input to the agent.
-            thread_id: Optional ID of an existing thread to continue.
-            max_steps: Maximum number of agent turns allowed in the interaction.
+            message: The initial message content.
+            recipient_agent: The agent (instance or name) to receive the message.
+            thread_id: Optional ID of an existing thread to use.
+            text_only: If True, request only the final text output from the agent.
+            **kwargs: Additional keyword arguments to pass to the agent's get_response method.
 
         Returns:
-            The RunResult from the *last* agent that executed in the sequence.
+            The final text output (if text_only=True) or the full RunResult object
+            as returned by the agent.
         """
         logger.info(
-            f"Starting interaction... Initial agent: {initial_agent}, Thread ID: {thread_id}, Max steps: {max_steps}"
+            f"Agency delegating get_response to agent: {getattr(recipient_agent, 'name', recipient_agent)} in thread: {thread_id or '(new)'}"
         )
-        current_state = InteractionState.INITIALIZING
-        logger.debug(f"Thread {thread_id or '(new)'} state -> {current_state}")
 
         # Resolve agent instance
-        if isinstance(initial_agent, str):
-            agent_name = initial_agent
+        if isinstance(recipient_agent, str):
+            agent_name = recipient_agent
             if agent_name not in self.agents:
-                error_msg = f"Initial agent '{agent_name}' not found in this agency."
+                error_msg = f"Recipient agent '{agent_name}' not found in this agency."
                 logger.error(error_msg)
                 raise ValueError(error_msg)
-            current_agent = self.agents[agent_name]
-        elif isinstance(initial_agent, Agent):
-            current_agent = initial_agent
-            if current_agent.name not in self.agents or id(self.agents[current_agent.name]) != id(
-                current_agent
+            agent_instance = self.agents[agent_name]
+        elif isinstance(recipient_agent, Agent):
+            agent_instance = recipient_agent
+            # Ensure the instance provided is actually managed by this agency
+            if agent_instance.name not in self.agents or id(self.agents[agent_instance.name]) != id(
+                agent_instance
             ):
-                error_msg = f"Provided agent instance '{current_agent.name}' is not registered with this agency."
+                error_msg = f"Provided agent instance '{agent_instance.name}' is not registered with this agency."
                 logger.error(error_msg)
                 raise ValueError(error_msg)
         else:
-            raise TypeError(f"Invalid type for initial_agent: {type(initial_agent)}")
-
-        # Get thread and add initial message
-        thread_id, thread = self.get_or_create_thread(thread_id)
-        thread.add_user_message(message)
-
-        # Initialize interaction context with state
-        # Use setdefault to avoid overwriting if context partially exists (e.g., from retry)
-        interaction_data = self.interaction_context.setdefault(thread_id, {})
-        interaction_data["state"] = InteractionState.ROUTING  # State before first agent turn
-        current_state = interaction_data["state"]
-        logger.debug(f"Thread {thread_id} state -> {current_state}")
-
-        logger.info(
-            f"Starting interaction loop for agent {current_agent.name} in thread {thread_id}"
-        )
-
-        # --- Interaction Loop ---
-        current_step = 0
-        last_result: Optional[RunResult] = None
-
-        try:
-            while current_step < max_steps:
-                current_step += 1
-
-                # Set state before agent execution
-                interaction_data["state"] = InteractionState.AGENT_TURN
-                current_state = interaction_data["state"]
-                logger.info(
-                    f"--- Interaction Step {current_step}/{max_steps}, Agent: {current_agent.name}, State: {current_state} ---"
-                )
-
-                result = await self._execute_agent_turn(
-                    current_agent,
-                    thread,
-                    interaction_data,  # Pass the whole context dict
-                )
-                last_result = result
-
-                # Check for SendMessage tool call to determine next agent
-                send_call_data = self._parse_send_message_call(result)
-
-                if send_call_data:
-                    recipient_name, message_content = send_call_data
-                    sender_name = current_agent.name
-
-                    logger.info(
-                        f"Agent {sender_name} requested to send message to {recipient_name}."
-                    )
-
-                    # Validate communication path
-                    if not self.is_communication_allowed(sender_name, recipient_name):
-                        error_msg = f"Communication DENIED: Agent '{sender_name}' is not allowed to send messages to '{recipient_name}' according to the agency chart."
-                        logger.error(error_msg)
-                        interaction_data["state"] = InteractionState.ERROR  # Update state on error
-                        current_state = interaction_data["state"]
-                        logger.debug(f"Thread {thread_id} state -> {current_state}")
-                        # TODO: Decide how to handle disallowed communication
-                        logger.warning(
-                            "Ending interaction due to disallowed communication attempt."
-                        )
-                        break
-
-                    # Find recipient agent
-                    next_agent = self.agents.get(recipient_name)
-                    if not next_agent:
-                        logger.error(
-                            f"Recipient agent '{recipient_name}' not found in agency. Ending interaction."
-                        )
-                        interaction_data["state"] = InteractionState.ERROR  # Update state on error
-                        current_state = interaction_data["state"]
-                        logger.debug(f"Thread {thread_id} state -> {current_state}")
-                        # TODO: Handle missing recipient agent
-                        break
-
-                    # Prepare for next agent's turn
-                    interaction_data["state"] = (
-                        InteractionState.ROUTING
-                    )  # State before next agent turn
-                    current_state = interaction_data["state"]
-                    logger.info(
-                        f"Routing message from {sender_name} to {recipient_name}. State: {current_state}"
-                    )
-                    thread.add_user_message(message_content)
-                    current_agent = next_agent
-                    # Continue loop
-
-                else:
-                    # Agent turn completed without SendMessage, sequence ends
-                    interaction_data["state"] = InteractionState.FINISHED
-                    current_state = interaction_data["state"]
-                    logger.info(
-                        f"Agent {current_agent.name} did not send a message. Interaction sequence complete. State: {current_state}"
-                    )
-                    break
-
-            if current_step >= max_steps and interaction_data["state"] not in [
-                InteractionState.FINISHED,
-                InteractionState.ERROR,
-            ]:
-                interaction_data["state"] = InteractionState.MAX_STEPS_REACHED
-                current_state = interaction_data["state"]
-                logger.warning(
-                    f"Interaction reached max steps ({max_steps}). State: {current_state}"
-                )
-
-        except Exception as e:
-            # Ensure state is updated even if error occurs outside the main checks
-            if thread_id in self.interaction_context:
-                self.interaction_context[thread_id]["state"] = InteractionState.ERROR
-                current_state = self.interaction_context[thread_id]["state"]
-            else:  # Should not happen if context was set
-                current_state = InteractionState.ERROR
-            logger.error(f"Interaction failed. State: {current_state}. Error: {e}", exc_info=True)
-            raise
-        finally:
-            # Log final state before cleanup
-            final_state = self.interaction_context.get(thread_id, {}).get(
-                "state", InteractionState.ERROR
-            )  # Get state safely
-            logger.debug(
-                f"Cleaning up interaction context for thread {thread_id}. Final state: {final_state}"
+            raise TypeError(
+                f"Invalid type for recipient_agent: {type(recipient_agent)}. Expected str or agency_swarm.Agent."
             )
-            if thread_id in self.interaction_context:
-                del self.interaction_context[thread_id]
 
-        # --- Return Final Result ---
-        logger.info(
-            f"Interaction finished in thread {thread_id}. Returning last result. Final State: {final_state}"
-        )
-        if last_result is None:
-            logger.error("Interaction ended unexpectedly with no result.")
-            raise RuntimeError("Interaction ended without producing any result.")
+        # --- Get Thread ID (create if None) ---
+        # The agent's get_response method will handle thread creation/retrieval
+        # via the ThreadManager injected during config, so we just need the ID.
+        if not thread_id:
+            # If no thread_id provided, generate one for the agent to use/create
+            thread_id = f"as_thread_{uuid.uuid4()}"
+            logger.info(f"No thread_id provided, generated new one: {thread_id}")
 
-        return last_result
+        # --- Direct Delegation ---
+        try:
+            result = await agent_instance.get_response(
+                message=message,
+                chat_id=thread_id,  # Pass the resolved/generated thread ID
+                sender_name=None,  # Initial call is from user/external
+                text_only=text_only,
+                **kwargs,  # Pass through any additional arguments
+            )
+            # Agent's get_response is responsible for the full orchestration
+            # and returning the appropriate type based on text_only flag.
+            return result
+        except Exception as e:
+            logger.error(
+                f"Error during delegated call to agent {agent_instance.name}.get_response: {e}",
+                exc_info=True,
+            )
+            raise  # Re-raise the exception
 
-    # --- Backward Compatibility & Demo Methods (Placeholders) ---
-
-    async def run_interaction_streamed(
+    async def get_response_stream(
         self,
-        initial_agent: Union[str, Agent],
-        message: TResponseInputItem,
+        message: str,
+        recipient_agent: Union[str, Agent],
         thread_id: Optional[str] = None,
-        max_steps: int = 25,
-    ):
-        """(Placeholder for Task 14/16) Runs the interaction and yields streaming results."""
-        logger.warning("run_interaction_streamed is not fully implemented yet.")
-        # TODO (Task 14/16): Implement streaming orchestration
-        yield "Streaming not implemented."  # Placeholder yield
+        **kwargs: Any,
+    ) -> AsyncGenerator[Any, None]:
+        """
+        Initiates a streaming interaction with the specified agent.
+        Delegates the actual streaming execution and orchestration to the agent's
+        get_response_stream method.
+
+        Args:
+            message: The initial message content.
+            recipient_agent: The agent (instance or name) to receive the message.
+            thread_id: Optional ID of an existing thread to use.
+            **kwargs: Additional keyword arguments to pass to the agent's get_response_stream method.
+
+        Yields:
+            Chunks from the agent's streaming response. The exact type depends
+            on the implementation of Agent.get_response_stream.
+        """
+        logger.info(
+            f"Agency delegating get_response_stream to agent: {getattr(recipient_agent, 'name', recipient_agent)} in thread: {thread_id or '(new)'}"
+        )
+
+        # Resolve agent instance (same logic as get_response)
+        if isinstance(recipient_agent, str):
+            agent_name = recipient_agent
+            if agent_name not in self.agents:
+                error_msg = f"Recipient agent '{agent_name}' not found in this agency."
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+            agent_instance = self.agents[agent_name]
+        elif isinstance(recipient_agent, Agent):
+            agent_instance = recipient_agent
+            if agent_instance.name not in self.agents or id(self.agents[agent_instance.name]) != id(
+                agent_instance
+            ):
+                error_msg = f"Provided agent instance '{agent_instance.name}' is not registered with this agency."
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+        else:
+            raise TypeError(
+                f"Invalid type for recipient_agent: {type(recipient_agent)}. Expected str or agency_swarm.Agent."
+            )
+
+        # --- Get Thread ID (create if None) ---
+        if not thread_id:
+            thread_id = f"as_thread_{uuid.uuid4()}"
+            logger.info(f"No thread_id provided, generated new one for stream: {thread_id}")
+
+        # --- Direct Delegation of Stream ---
+        try:
+            async for chunk in agent_instance.get_response_stream(
+                message=message,
+                chat_id=thread_id,  # Pass the resolved/generated thread ID
+                sender_name=None,  # Initial call is from user/external
+                **kwargs,  # Pass through any additional arguments
+            ):
+                yield chunk  # Yield directly from the agent's stream generator
+        except Exception as e:
+            logger.error(
+                f"Error during delegated call to agent {agent_instance.name}.get_response_stream: {e}",
+                exc_info=True,
+            )
+            # How to signal error in async generator? Re-raise? Yield specific error object?
+            # Re-raising seems most direct for now.
+            raise
+
+    # --- Backward Compatibility & Demo Methods ---
 
     async def get_completion(
         self,
@@ -483,49 +411,112 @@ class Agency:
         message_files: Optional[List[str]] = None,
         recipient_agent: Optional[Union[str, Agent]] = None,
         thread_id: Optional[str] = None,
-        yield_messages: bool = False,  # Deprecated? SDK likely handles streaming differently
-        # ... other original params?
+        yield_messages: bool = False,
     ) -> Union[str, List[Dict[str, Any]]]:
-        """(Placeholder for Task 17) Backward compatibility for get_completion."""
-        logger.warning("get_completion is a backward compatibility method and may be removed.")
-        # TODO (Task 17): Map to run_interaction, handle message_files if supported
-        if yield_messages:
-            logger.warning("yield_messages is deprecated.")
-            return []  # Or raise error
+        """(Backward Compatibility) Initiates interaction, delegates via get_response.
 
-        # Simplified mapping for now
+        Args:
+            message: User message content.
+            message_files: Optional list of file paths (Note: Automatic upload not fully implemented).
+            recipient_agent: The target agent (name or instance).
+            thread_id: Optional thread ID.
+            yield_messages: If True, returns the full thread history (list of dicts) instead of just the final text.
+
+        Returns:
+            The final agent text response (str) or the full thread history (List[Dict]).
+        """
+        logger.warning(
+            "get_completion is a backward compatibility method. Use get_response for RunResult or text_only=True."
+        )
         if not recipient_agent:
-            # Need a default recipient logic or raise error
             raise ValueError("recipient_agent must be specified for get_completion.")
+        if message_files:
+            logger.warning(
+                "message_files parameter in get_completion is not fully supported for automatic upload yet."
+            )
+            # TODO: Consider calling agent.upload_file here first if required?
 
-        # Convert simple string message to TResponseInputItem if needed
-        input_item = UserInputItem(content=message)  # Basic conversion
+        try:
+            # Call the primary agency method, requesting RunResult (text_only=False)
+            # so we can potentially return the full history if yield_messages=True.
+            result = await self.get_response(
+                message=message,
+                recipient_agent=recipient_agent,
+                thread_id=thread_id,
+                text_only=False,  # Get RunResult to access history if needed
+            )
 
-        result = await self.run_interaction(recipient_agent, input_item, thread_id)
-        # Extract final message content (assuming it's in the last item)
-        if result and result.items:
-            last_item = result.items[-1]
-            if isinstance(last_item, MessageOutputItem):
-                return last_item.content
-        return ""  # Default empty response
+            # Handle yield_messages
+            if yield_messages:
+                logger.warning(
+                    "yield_messages=True behavior changed: Returning full thread log as list of dicts."
+                )
+                # Need thread_id from result to re-fetch thread state
+                final_thread_id = getattr(
+                    result, "thread_id", thread_id
+                )  # Get ID from result if available
+                if not final_thread_id:
+                    # This shouldn't happen if get_response worked, but handle defensively
+                    logger.error(
+                        "Could not determine thread ID to fetch history for yield_messages."
+                    )
+                    return []
+                _, final_thread = self.get_or_create_thread(final_thread_id)
+                # Assuming get_full_log returns List[RunItem]
+                # Convert RunItems to dicts for backward compatibility
+                return [item.model_dump() for item in final_thread.get_full_log()]
+            else:
+                # Default: return final text output
+                final_text = getattr(result, "final_output_text", None)  # Safely get text
+                return final_text if final_text is not None else ""
 
-    async def get_completion_streamed(
+        except Exception as e:
+            logger.error(f"Error during get_completion: {e}", exc_info=True)
+            return ""  # Original behavior on error?
+
+    async def get_completion_stream(
         self,
         message: str,
         message_files: Optional[List[str]] = None,
         recipient_agent: Optional[Union[str, Agent]] = None,
         thread_id: Optional[str] = None,
-        # ... other original params?
-    ):
-        """(Placeholder for Task 17) Backward compatibility for get_completion_streamed."""
+    ) -> AsyncGenerator[str, None]:
+        """(Backward Compatibility) Initiates streaming interaction, delegates via get_response_stream.
+
+        Yields:
+            Text chunks (str) from the agent's response stream.
+        """
         logger.warning(
-            "get_completion_streamed is a backward compatibility method and may be removed."
+            "get_completion_stream is a backward compatibility method. Use get_response_stream."
         )
-        # TODO (Task 17): Map to run_interaction_streamed
-        yield "Streaming compatibility not implemented."
+        if not recipient_agent:
+            raise ValueError("recipient_agent must be specified for get_completion_stream.")
+        if message_files:
+            logger.warning(
+                "message_files parameter in get_completion_stream is not fully supported yet."
+            )
+            # TODO: Handle file uploads before starting stream?
+
+        try:
+            # Call the primary agency streaming method
+            async for chunk in self.get_response_stream(
+                message=message, recipient_agent=recipient_agent, thread_id=thread_id
+            ):
+                # Adapt chunk format to yield simple text strings
+                # This requires knowing Agent.get_response_stream's yield type.
+                # Simple str conversion for now, might need refinement.
+                yield str(chunk)
+
+        except Exception as e:
+            logger.error(f"Error during get_completion_stream: {e}", exc_info=True)
+            yield f"Error: {e}"  # Yield error string
 
     def run_demo(self, height=600):
         """(Placeholder for Task 18) Runs a Gradio demo."""
         logger.warning("run_demo functionality is not implemented yet.")
-        # TODO (Task 18): Re-implement demo using Gradio or similar
         print("Demo functionality not available in this version.")
+
+    def demo_gradio(self, height=600):
+        """(Placeholder for Task 18) Launches a Gradio web interface for the agency."""
+        logger.warning("demo_gradio functionality is not implemented yet.")
+        print("Gradio demo functionality not available in this version.")

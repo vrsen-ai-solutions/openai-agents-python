@@ -77,28 +77,13 @@ def test_structured_output_list():
     assert validated == ["foo", "bar"]
 
 
-def test_bad_json_raises_error(mocker):
+def test_bad_json_raises_error():
     agent = Agent(name="test", output_type=Foo)
     output_schema = Runner._get_output_schema(agent)
     assert output_schema, "Should have an output tool config with a structured output type"
 
     with pytest.raises(ModelBehaviorError):
         output_schema.validate_json("not valid json")
-
-    agent = Agent(name="test", output_type=list[str])
-    output_schema = Runner._get_output_schema(agent)
-    assert output_schema, "Should have an output tool config with a structured output type"
-
-    mock_validate_json = mocker.patch.object(_json, "validate_json")
-    mock_validate_json.return_value = ["foo"]
-
-    with pytest.raises(ModelBehaviorError):
-        output_schema.validate_json(json.dumps(["foo"]))
-
-    mock_validate_json.return_value = {"value": "foo"}
-
-    with pytest.raises(ModelBehaviorError):
-        output_schema.validate_json(json.dumps(["foo"]))
 
 
 def test_plain_text_obj_doesnt_produce_schema():

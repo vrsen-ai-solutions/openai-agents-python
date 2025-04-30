@@ -59,7 +59,7 @@ class ConversationThread:
         """Returns the complete, raw list of RunItems for this thread."""
         return list(self.items)
 
-    # No execution stack needed here anymore.
+    # No execution stack needed here anymore. The program's call stack manages recursion.
 ```
 
 ### 2.2. `ThreadManager`
@@ -153,7 +153,7 @@ class ThreadManager:
 *   **Persistence via Callbacks:** Thread persistence relies entirely on user-provided `load` and `save` callbacks, identified by a composite key derived from `chat_id` and participant names.
 *   **`ThreadManager`:** Centralizes thread retrieval, creation, caching (in-memory), and persistence logic. An instance of this manager will likely be created/configured by the `Agency`.
 *   **Agent Integration:** The `agency_swarm.Agent`'s `get_response` method will use the `ThreadManager` to fetch the correct `ConversationThread` before starting its execution loop or when handling a `send_message` call. After adding items, the agent logic will call `ThreadManager.save_thread`.
-*   **No Execution State:** The `ConversationThread` no longer needs an execution stack. The program's call stack manages the recursive flow of `Agent.get_response` calls.
+*   **No Execution State:** The `ConversationThread` **does not** manage an execution stack. The program's call stack handles the recursive flow of `Agent.get_response` calls.
 
 ## 4. Sequence Diagram Integration:
 

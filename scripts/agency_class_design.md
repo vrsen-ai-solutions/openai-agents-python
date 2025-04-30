@@ -1,6 +1,6 @@
 # Agency Class Design (Task 6 - Revised)
 
-This document outlines the revised design for the `Agency` class, positioning it as a setup and configuration layer rather than a runtime orchestrator in the Agency Swarm SDK fork.
+This document outlines the revised design for the `Agency` class, positioning it as **strictly a setup and configuration layer**. It does **not** handle runtime orchestration, which is managed entirely by the `agency_swarm.Agent` class.
 
 ## 1. Goals
 
@@ -9,8 +9,9 @@ This document outlines the revised design for the `Agency` class, positioning it
 *   Parse the `agency_chart` to understand allowed communication paths.
 *   Inject the `send_message` tool into agents based on the `agency_chart`.
 *   Initialize and configure the `ThreadManager` with persistence callbacks.
-*   Configure individual agents with necessary references (e.g., to the `ThreadManager`, peer lists, potentially a reference back to the `Agency` instance for accessing shared resources/agents).
-*   Provide backward-compatible methods (`get_completion`, `get_completion_stream`) that delegate to the appropriate `Agent.get_response` methods.
+*   Configure individual agents with necessary references (e.g., to the `ThreadManager`, peer lists, `Agency` instance).
+*   Provide primary user-facing interaction methods (`get_response`, `get_response_stream`) that **delegate directly** to the appropriate `Agent` method.
+*   Provide backward-compatible methods (`get_completion`, `get_completion_stream`) that also delegate to the appropriate `Agent` method.
 *   Set up shared resources (instructions, files - TBD) and default settings.
 *   Facilitate demo methods (`run_demo`, `demo_gradio`).
 
@@ -31,7 +32,7 @@ AgencyChart = List[AgencyChartEntry]
 
 class Agency:
     """ Manages a collection of Agents, sets up communication paths,
-        and provides backward compatibility methods.
+        and provides delegation methods to initiate agent interactions.
         Does NOT handle runtime orchestration directly.
     """
 
@@ -167,57 +168,113 @@ class Agency:
                 # agent_instance.instructions = self.shared_instructions + "\n\n" + (agent_instance.instructions or "")
                 pass
 
-    # --- User-Facing Interaction Methods (Backward Compatibility) ---
+    # --- Primary User-Facing Interaction Methods --- (Delegation to Agent)
 
-    async def get_completion(
+    async def get_response(
         self,
-        message: str,
+        message: str, # Or TResponseInputItem?
         chat_id: str,
-        starting_agent: Union[str, Agent],
-        text_only: bool = True, # Default to True for original get_completion behavior
+        recipient_agent: Union[str, Agent],
+        text_only: bool = False,
         **kwargs
-    ) -> str:
-        """Backward compatible method, delegates to Agent.get_response."""
-        print(f"[Agency.get_completion] Received call. Delegating to Agent {starting_agent}")
-        agent_name = starting_agent if isinstance(starting_agent, str) else starting_agent.name
+    ) -> Union[str, RunResult]:
+        """Initiates an interaction by sending a message to the specified agent.
+           Delegates the actual execution and orchestration to the agent's get_response method.
+        """
+        print(f"[Agency.get_response] Delegating to Agent {recipient_agent}")
+        agent_name = recipient_agent if isinstance(recipient_agent, str) else recipient_agent.name
         if agent_name not in self.agents:
-            raise ValueError(f"Starting agent '{agent_name}' not found in agency.")
+            raise ValueError(f"Recipient agent '{agent_name}' not found in agency.")
 
         agent_instance = self.agents[agent_name]
 
-        # Call the agent's primary method
+        # Direct delegation
+        # The agent's get_response handles the full loop, including potential recursion
         result = await agent_instance.get_response(
-            message=message,
+            message=message, # Pass the initial message content
             chat_id=chat_id,
-            sender_name=None, # Call originates from user
+            sender_name=None, # Initial call originates from user/external
             text_only=text_only,
-            **kwargs
+            **kwargs # Pass any extra kwargs to the agent method
         )
 
-        # Ensure text return for get_completion signature
-        if isinstance(result, RunResult):
-            return result.final_output_text
-                else:
-            return str(result) # Should already be string if text_only=True
+        # Return the result obtained from the agent
+        return result # Agent method already returns str or RunResult based on text_only
 
-    async def get_completion_stream(self, message: str, chat_id: str, starting_agent: Union[str, Agent], **kwargs) -> AsyncGenerator[str, None]:
-        """Backward compatible streaming method, delegates to Agent.get_response_stream."""
-        print(f"[Agency.get_completion_stream] Received call. Delegating to Agent {starting_agent}")
-        agent_name = starting_agent if isinstance(starting_agent, str) else starting_agent.name
+    async def get_response_stream(
+        self,
+        message: str, # Or TResponseInputItem?
+        chat_id: str,
+        recipient_agent: Union[str, Agent],
+        **kwargs
+    ) -> AsyncGenerator[Any, None]: # Yield type determined by Agent.get_response_stream
+        """Initiates a streaming interaction with the specified agent.
+           Delegates the actual streaming execution and orchestration to the agent's
+           get_response_stream method.
+        """
+        print(f"[Agency.get_response_stream] Delegating to Agent {recipient_agent}")
+        agent_name = recipient_agent if isinstance(recipient_agent, str) else recipient_agent.name
         if agent_name not in self.agents:
-            raise ValueError(f"Starting agent '{agent_name}' not found in agency.")
+            raise ValueError(f"Recipient agent '{agent_name}' not found in agency.")
 
         agent_instance = self.agents[agent_name]
 
+        # Direct delegation of the stream
         async for chunk in agent_instance.get_response_stream(
             message=message,
             chat_id=chat_id,
             sender_name=None,
             **kwargs
         ):
-             # Ensure chunks are strings for backward compatibility?
-             # The underlying stream might yield different types (RunItems, etc.)
-             # TODO: Adapt chunk processing as needed based on get_response_stream's yield type.
+            yield chunk # Yield chunks directly from the agent's stream
+
+    # --- Backward Compatibility Methods --- (Also delegate)
+    async def get_completion(
+        self,
+        message: str,
+        chat_id: str,
+        recipient_agent: Union[str, Agent], # Changed from starting_agent for clarity
+        text_only: bool = True,
+        **kwargs
+    ) -> str:
+        """Backward compatible method, delegates to the agent's get_response method.
+           Note: Uses recipient_agent parameter like newer methods.
+        """
+        # Simplification: Directly call the agent's get_response via the new Agency method
+        print(f"[Agency.get_completion] Delegating via get_response to Agent {recipient_agent}")
+        result = await self.get_response(
+            message=message,
+            chat_id=chat_id,
+            recipient_agent=recipient_agent,
+            text_only=True, # Ensure text return for backward compatibility
+            **kwargs
+        )
+        # get_response already handles text_only logic
+        return result if isinstance(result, str) else str(result) # Ensure string
+
+    async def get_completion_stream(
+        self,
+        message: str,
+        chat_id: str,
+        recipient_agent: Union[str, Agent], # Changed from starting_agent
+        **kwargs
+    ) -> AsyncGenerator[str, None]:
+        """Backward compatible streaming method, delegates to Agent.get_response_stream.
+           Yields strings for compatibility.
+           Note: Uses recipient_agent parameter like newer methods.
+        """
+        # Simplification: Directly call the agent's stream via the new Agency method
+        print(f"[Agency.get_completion_stream] Delegating via get_response_stream to Agent {recipient_agent}")
+        async for chunk in self.get_response_stream(
+            message=message,
+            chat_id=chat_id,
+            recipient_agent=recipient_agent,
+            **kwargs
+        ):
+             # TODO: Adapt chunk processing to yield only strings as needed based on
+             # the actual yield type of Agent.get_response_stream.
+             # This requires knowing what Agent.get_response_stream yields (raw chunks, RunItems?).
+             # Assuming it yields processable chunks or strings for now.
              yield str(chunk)
 
     # --- Demo Methods ---
@@ -237,12 +294,13 @@ class Agency:
 
 ## 3. Key Design Decisions & Considerations:
 
-*   **Thin Layer:** The `Agency` is primarily a configuration and setup class. It does not contain the runtime execution loop.
-*   **Setup Responsibility:** Its main jobs are parsing the `agency_chart`, creating/configuring the `ThreadManager`, adding the `send_message` tool to agents, and injecting necessary references (`ThreadManager`, peer lists, `Agency` instance) into each `Agent`.
-*   **Agent-Centric Delegation:** User-facing methods (`get_completion*`) delegate directly to the appropriate `Agent.get_response*` method.
-*   **`send_message` Tool:** The tool is defined here but relies on the `Agent`'s internal logic to intercept calls to it.
+*   **Strictly Setup/Delegation:** The `Agency` class **only** handles setup (agent registration, chart parsing, tool injection, ThreadManager config) and **delegates** all runtime execution requests (`get_response`, `get_completion`, etc.) directly to the appropriate `agency_swarm.Agent` instance's methods.
+*   **No Runtime Logic:** The `Agency` contains **no** runtime execution loop, state management, or direct interaction with the LLM during a conversation turn.
+*   **Setup Responsibility:** Its main jobs remain parsing the `agency_chart`, creating/configuring the `ThreadManager`, adding the `send_message` tool schema to agents, and injecting necessary references (`ThreadManager`, peer lists, `Agency` instance) into each `Agent`.
+*   **Agent-Centric Orchestration:** All orchestration logic, including the execution loop, `send_message` interception, and recursive agent calls, resides **entirely** within the `agency_swarm.Agent` class.
+*   **`send_message` Tool:** The tool schema is defined in `Agency`, but its interception and handling occur within the `Agent`'s internal execution logic.
 *   **Persistence Setup:** Takes `load/save` callbacks and passes them to the `ThreadManager`.
-*   **Backward Compatibility:** Provides `get_completion*` methods with signatures closer to the original Agency Swarm, acting as wrappers around the new agent-level methods.
+*   **Backward Compatibility:** Provides `get_completion*` methods that now delegate through the primary `get_response*` methods, maintaining the original intent while simplifying the Agency class.
 
 ## 4. Open Questions/Refinements:
 
@@ -250,4 +308,4 @@ class Agency:
 *   How are shared resources (instructions, files) best applied to agents during configuration?
 *   Final implementation details for demo methods.
 
-This revised design slims down the `Agency` class significantly, aligning with the goal of making `Agent` the core independent unit and keeping `Agency` as a setup/compatibility layer.
+This revised design **strictly defines** the `Agency` class as a setup/delegation layer, ensuring that the `Agent` class is the sole location for runtime orchestration logic, aligning with the Agent-centric design goal.

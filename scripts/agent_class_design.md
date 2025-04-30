@@ -6,8 +6,8 @@ This document details the revised design for the `agency_swarm.Agent` class, inh
 
 *   Provide a familiar interface for users migrating from the original Agency Swarm.
 *   Integrate seamlessly with the OpenAI Agents SDK foundation (`agents.Agent`).
-*   Act as the main entry point for agent execution (`get_response`).
-*   Manage the internal execution loop, including LLM calls, standard tool execution, and handling `send_message` tool calls for invoking other agents.
+*   Act as the **sole entry point and executor** for agent execution and multi-agent orchestration via its `get_response` and `get_response_stream` methods.
+*   Manage the **complete internal execution loop**, including LLM calls, standard tool execution, **detecting and handling `send_message` tool calls**, and **initiating recursive calls to other agents**.
 *   Support both SDK (`@function_tool`) and potentially Agency Swarm tool definitions (loading from folder - postponed for V1).
 *   Implement Agency Swarm's file/vector store handling logic without relying on `settings.json`.
 *   Interact with the `ThreadManager` to use the correct, isolated `ConversationThread` for each interaction (User <-> Self, Self <-> Other Agent).
@@ -155,7 +155,13 @@ class Agent(BaseAgent):
         **kwargs: Any # Pass additional args to model provider?
     ) -> Union[str, RunResult]:
         """The main entry point for agent execution and orchestration.
-        Handles the conversation loop, tool calls, and invoking other agents via send_message.
+        **Manages the entire execution loop for this agent and orchestrates communication with other agents.**
+        This includes:
+        - Calling the LLM.
+        - Handling standard tool calls.
+        - **Intercepting `send_message` tool calls.**
+        - **Making recursive calls to other agents' `get_response` methods.**
+        - Utilizing the `ThreadManager` for isolated conversation history.
 
         Args:
             message: The input message.
@@ -352,7 +358,11 @@ class Agent(BaseAgent):
         sender_name: Optional[str] = None,
         **kwargs: Any
     ) -> AsyncGenerator[Any, None]: # Yield streaming chunks
-        """Gets a streaming response. Handles orchestration internally."""
+        """Gets a streaming response. Handles orchestration internally.
+        Manages the streaming execution loop and orchestrates streaming communication
+        with other agents via recursive calls to `get_response_stream`.
+        Yields events (e.g., RunItems, raw LLM chunks) as they occur.
+        """
         # TODO: Implement streaming version of the get_response logic.
         # This requires adapting the loop to yield RunItems as they are generated/processed.
         # Streaming recursive calls needs careful handling.
@@ -365,13 +375,13 @@ class Agent(BaseAgent):
 
 ## 3. Key Design Decisions & Considerations:
 
-*   **Agent-Centric Execution:** `Agent.get_response` is the core method containing the execution loop and orchestration logic.
-*   **Recursion for Communication:** Agent-to-agent communication happens via direct, recursive calls to `recipient_agent.get_response`.
+*   **Agent-Centric Execution:** `Agent.get_response` is the core method containing the **entire** execution loop and orchestration logic for multi-agent interactions originating from this agent.
+*   **Recursion for Communication:** Agent-to-agent communication happens via direct, recursive calls from the sender agent's `get_response` to the recipient agent's `get_response`.
 *   **Thread Management:** Relies on an external `ThreadManager` (provided during init) to get the correct, isolated `ConversationThread` based on `chat_id` and participants.
 *   **`send_message` Interception:** The agent's internal loop detects `send_message` tool calls and triggers the recursive call logic instead of executing a dummy function.
-*   **`Agency` Role:** The `Agency` is primarily for setup (injecting `send_message` tool based on `agency_chart`, configuring agents with `ThreadManager` and peer lists) and backward compatibility.
+*   **`Agency` Role:** The `Agency` is primarily for setup (injecting `send_message` tool based on `agency_chart`, configuring agents with `ThreadManager` and peer lists) and providing backward-compatible delegation methods that ultimately call `Agent.get_response`.
 *   **A2A Alignment:** This design makes the `Agent` a more independent unit, suitable for potential A2A integration.
-*   **Complexity:** The orchestration logic now resides within the `Agent` class, making it more complex than the base SDK agent.
+*   **Complexity:** The orchestration logic now resides **entirely** within the `Agent` class, making it more complex than the base SDK agent but self-contained.
 *   **Dependencies:** Requires the `ThreadManager` and `ConversationThread` designs.
 
 ## 4. Open Questions/Refinements:

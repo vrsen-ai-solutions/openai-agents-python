@@ -1,27 +1,27 @@
 # Agent Orchestration Logic Design (Task 4 - Revised)
 
-This document outlines the revised design for the orchestration logic, which now resides primarily *within* the `agency_swarm.Agent.get_response` method, enabling Agent-centric execution and multi-agent communication.
+This document outlines the revised design for the orchestration logic, which now resides **exclusively** *within* the `agency_swarm.Agent.get_response` and `get_response_stream` methods, enabling fully Agent-centric execution and multi-agent communication. The `Agency` class does *not* contain runtime orchestration logic.
 
 ## 1. Goals
 
-*   Implement the core execution loop within `Agent.get_response`.
+*   Implement the **complete** core execution loop within `Agent.get_response`.
 *   Handle LLM calls, processing of responses, and standard tool execution based on the base SDK's patterns (e.g., `_run_impl.py`).
-*   Intercept `send_message` tool calls specifically.
-*   Initiate recursive calls to other agents upon detecting `send_message`.
+*   Intercept `send_message` tool calls specifically within the `Agent` loop.
+*   Initiate recursive calls to other agents' `get_response`/`get_response_stream` methods directly from the sending agent upon detecting `send_message`.
 *   Utilize the `ThreadManager` and correctly scoped `ConversationThread` objects for history management during self-execution and recursive calls.
-*   Return results (including those from sub-agents) correctly formatted as `ToolCallOutputItem` to the agent's own execution context.
-*   Support both synchronous (`get_response`) and eventually streaming (`get_response_stream`) modes.
+*   Return results (including those from sub-agents) correctly formatted as `ToolCallOutputItem` to the **calling agent's** execution context.
+*   Support both synchronous (`get_response`) and eventually streaming (`get_response_stream`) modes **within the Agent class**.
 
 ## 2. Orchestration Logic Flow (within `Agent.get_response`)
 
-The `Agent.get_response` method orchestrates the agent's own execution and interactions with other agents.
+The `Agent.get_response` method **is the orchestrator**. It manages the agent's own execution turn and initiates interactions with other agents when required by the LLM's use of the `send_message` tool.
 
 **High-Level Steps:**
 
 1.  **Initialization:**
     *   Verify `ThreadManager` is configured.
     *   Get the appropriate `ConversationThread` for the current interaction (e.g., User<->Self or CallerAgent<->Self) using `ThreadManager.get_thread(chat_id, self.name, sender_name)`.
-    *   Add the incoming `message` as a `MessageInputItem` to the thread and save via `ThreadManager`.
+    *   Add the incoming `message` as a `MessageInputItem` to the thread and save via `ThreadManager` **(if this agent is the entry point, otherwise the message comes from the SendMessage call)**.
 2.  **Execution Loop (synchronous `get_response` example):**
     *   Loop until a final output is determined or `max_steps` is reached.
     *   **Prepare for LLM:**
@@ -70,24 +70,31 @@ The `Agent.get_response` method orchestrates the agent's own execution and inter
 **Streaming (`get_response_stream`):**
 
 *   The overall logic is similar, but the implementation needs to yield `RunItem`s as they are added to the thread.
-*   When a recursive `send_message` call is made, the orchestrator needs to `await` the *streaming* response from the sub-agent (`recipient_agent.get_response_stream`) and yield its chunks *before* continuing its own execution.
-*   This requires careful management of asynchronous generators.
+*   When a recursive `send_message` call is made, the **calling agent** awaits the response (or stream) from the sub-agent (`recipient_agent.get_response` / `recipient_agent.get_response_stream`) and processes the result (or yields its chunks) *before* continuing its own execution.
+*   This requires careful management of asynchronous calls/generators within the `Agent.get_response`/`Agent.get_response_stream` methods.
 
 ## 3. Key Concepts Reiteration
 
-*   **Agent Responsibility:** The `Agent` manages its own turn-by-turn execution.
-*   **Recursion:** `send_message` triggers a direct recursive call to another agent's `get_response`.
+*   **Agent Responsibility:** The `Agent` **is solely responsible** for managing its own turn-by-turn execution and initiating calls to other agents via `send_message` interception.
+*   **Recursion:** `send_message` detected within an Agent's run triggers a direct recursive call to another agent's `get_response` method **from the sending agent**.
 *   **State Isolation:** The `ThreadManager` ensures that the correct, isolated `ConversationThread` is used for each step (User<->A, A<->B, B<->C, etc.).
-*   **Result Propagation:** Results from recursive calls are returned to the caller and injected back into the caller's thread as `ToolCallOutputItem`s, allowing the caller to react to the sub-agent's output.
+*   **Result Propagation:** Results from recursive calls are returned to the **calling agent** and injected back into the **calling agent's** thread as `ToolCallOutputItem`s, allowing the caller to react to the sub-agent's output.
 
 ## 4. Comparison to Base SDK (`_run_impl.py`)
 
-*   This internal Agent orchestration loop adapts concepts from the SDK's `_run_impl.py`.
+*   This internal Agent orchestration loop adapts concepts from the SDK's `_run_impl.py` but significantly extends it.
 *   Key differences include:
-    *   Handling multiple, persistent threads via `ThreadManager`.
+    *   Orchestration logic resides within `Agent.get_response`, not an external `Runner`.
     *   Special interception logic for the `send_message` tool call.
     *   Executing recursive calls to other agents.
     *   Integration with `ThreadManager` for saving state after adding items.
+    *   Precise implementation of LLM calling (`ModelProvider` access **within the Agent**).
+    *   Exact implementation of standard tool execution logic within the agent loop.
+    *   Robust implementation of the streaming version (`get_response_stream`), especially handling streamed recursive calls.
+    *   Accurate collection of `generated_items` and `usage` for the final `RunResult` across nested calls.
+    *   Error handling for LLM failures or tool execution errors within the agent's loop.
+
+This design places the orchestration logic firmly and **exclusively** within the `Agent`, supporting the desired recursive communication pattern while leveraging the concept of isolated, persistent threads. The `Agency` class acts purely as a setup and delegation layer.
 
 ## 5. Open Questions/Refinements
 
@@ -96,5 +103,3 @@ The `Agent.get_response` method orchestrates the agent's own execution and inter
 *   Robust implementation of the streaming version, especially handling streamed recursive calls.
 *   Accurate collection of `generated_items` and `usage` for the final `RunResult` across nested calls.
 *   Error handling for LLM failures or tool execution errors within the loop.
-
-This design places the orchestration logic firmly within the `Agent`, supporting the desired recursive communication pattern while leveraging the concept of isolated, persistent threads.
