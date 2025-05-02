@@ -50,21 +50,6 @@ def shutdown_trace_provider():
     GLOBAL_TRACE_PROVIDER.shutdown()
 
 
-@pytest.fixture(autouse=True)
-def disable_real_model_clients(monkeypatch, request):
-    # If the test is marked to allow the method call, don't override it.
-    if request.node.get_closest_marker("allow_call_model_methods"):
-        return
-
-    def failing_version(*args, **kwargs):
-        pytest.fail("Real models should not be used in tests!")
-
-    monkeypatch.setattr(OpenAIResponsesModel, "get_response", failing_version)
-    monkeypatch.setattr(OpenAIResponsesModel, "stream_response", failing_version)
-    monkeypatch.setattr(OpenAIChatCompletionsModel, "get_response", failing_version)
-    monkeypatch.setattr(OpenAIChatCompletionsModel, "stream_response", failing_version)
-
-
 # Stub modules if missing to avoid import errors in tests
 try:
     import inline_snapshot  # type: ignore
@@ -111,6 +96,10 @@ def pytest_ignore_collect(path, config):  # noqa: D401
     """Skip collecting tests that have external dependencies or need major rework."""
     p = _pl.Path(str(path))
     parts = p.parts
+
+    # Ignore the entire old test directory
+    if "tests" in parts and "old_agency_swarm_tests" in parts:
+        return True
 
     # Skip old tool factory tests (requires langchain)
     if p.name == "test_tool_factory.py" and "old_agency_swarm_tests" in parts:

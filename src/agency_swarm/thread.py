@@ -1,13 +1,9 @@
-from __future__ import annotations
-
-import json
 import logging
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Union
 
-from agents import RunItem, RunResult, TResponseInputItem
-from agents.items import ItemHelpers, MessageOutputItem, ToolCallItem, ToolCallOutputItem
+from agents import RunResult, TResponseInputItem
 
 if TYPE_CHECKING:
     from .agent import Agent  # Use forward reference
@@ -22,34 +18,39 @@ class ConversationThread:
     """
 
     thread_id: str = field(default_factory=lambda: f"as_thread_{uuid.uuid4()}")
-    items: List[RunItem] = field(default_factory=list)
+    # Store TResponseInputItem dictionaries directly
+    items: List[TResponseInputItem] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def add_item(self, item: RunItem) -> None:
-        """Appends a RunItem (message, tool call, etc.) to the history."""
-        if not isinstance(item, RunItem):
+    def add_item(self, item: TResponseInputItem) -> None:
+        """Appends a TResponseInputItem dictionary to the history."""
+        # Basic validation: ensure it's a dict with a 'role'
+        if not isinstance(item, dict) or "role" not in item:
             logger.warning(
-                f"Attempted to add non-RunItem type {type(item)} to thread {self.thread_id}"
+                f"Attempted to add non-TResponseInputItem-like dict {type(item)} to thread {self.thread_id}"
             )
             return
         self.items.append(item)
-        logger.debug(f"Added item {type(item).__name__} to thread {self.thread_id}")
+        logger.debug(f"Added item with role '{item.get('role')}' to thread {self.thread_id}")
 
-    def add_items(self, items: Sequence[RunItem]) -> None:
-        """Appends multiple RunItems to the history."""
+    def add_items(self, items: Sequence[TResponseInputItem]) -> None:
+        """Appends multiple TResponseInputItem dictionaries to the history."""
         added_count = 0
         for item in items:
-            if isinstance(item, RunItem):
+            # Basic validation: ensure it's a dict with a 'role'
+            if isinstance(item, dict) and "role" in item:
                 self.items.append(item)
                 added_count += 1
             else:
                 logger.warning(
-                    f"Skipping non-RunItem type {type(item)} during add_items in thread {self.thread_id}"
+                    f"Skipping non-TResponseInputItem-like dict {type(item)} during add_items in thread {self.thread_id}"
                 )
         logger.debug(f"Added {added_count} items to thread {self.thread_id}")
 
     def add_run_result(self, result: RunResult) -> None:
-        """Adds all items from an agent's RunResult to the thread history."""
+        """Adds all items from an agent's RunResult to the thread history.
+        Converts RunItems to TResponseInputItem dictionaries before adding.
+        """
         if not hasattr(result, "items") or not result.items:
             logger.warning(
                 f"RunResult provided to add_run_result in thread {self.thread_id} has no items."
@@ -62,108 +63,56 @@ class ConversationThread:
             )
             return
 
-        self.add_items(result.items)
-        logger.info(f"Added {len(result.items)} items from RunResult to thread {self.thread_id}")
+        # Convert RunItems to TResponseInputItem before adding
+        items_to_add: List[TResponseInputItem] = []
+        for run_item in result.items:
+            if hasattr(run_item, "raw_item") and isinstance(run_item.raw_item, dict):
+                if run_item.raw_item.get("role") in ["user", "assistant", "tool"]:
+                    items_to_add.append(run_item.raw_item)
+                else:
+                    logger.warning(
+                        f"Skipping RunItem with invalid role in raw_item: {run_item.raw_item.get('role')}"
+                    )
+            else:
+                logger.warning(f"Skipping RunItem without a valid raw_item dict: {type(run_item)}")
+
+        self.add_items(items_to_add)
+        logger.info(f"Added {len(items_to_add)} items from RunResult to thread {self.thread_id}")
 
     def add_user_message(self, message: Union[str, TResponseInputItem]) -> None:
-        """Adds a user message to the thread history."""
-        item_to_add = None
+        """Adds a user message to the thread history as a TResponseInputItem dict."""
+        item_dict: TResponseInputItem
         if isinstance(message, str):
-            item_to_add = UserInputItem(content=message)
-        elif isinstance(message, UserInputItem):
-            item_to_add = message
+            item_dict = {"role": "user", "content": message}
         elif isinstance(message, dict) and message.get("role") == "user":
-            content = message.get("content")
-            if isinstance(content, str):
-                item_to_add = UserInputItem(content=content)
-            else:
-                logger.error(
-                    f"User message dict has invalid content type: {type(content)} in thread {self.thread_id}"
-                )
-                raise TypeError(f"Invalid content type in user message dict: {type(content)}")
+            if "content" not in message:
+                logger.error(f"User message dict missing 'content' key in thread {self.thread_id}")
+                raise ValueError("User message dict must have a 'content' key.")
+            item_dict = message
         else:
             logger.error(
                 f"Invalid type for add_user_message: {type(message)} in thread {self.thread_id}"
             )
             raise TypeError(
-                f"Unsupported message type for add_user_message: {type(message)}. Expecting str or UserInputItem."
+                f"Unsupported message type for add_user_message: {type(message)}. Expecting str or TResponseInputItem dict."
             )
-
-        self.add_item(item_to_add)
+        # Add the dictionary directly
+        self.add_item(item_dict)
         logger.info(f"Added user message to thread {self.thread_id}")
-
-    def _convert_item_to_openai_format(self, item: RunItem) -> Optional[Dict[str, Any]]:
-        """Converts a single RunItem to the OpenAI API message dictionary format."""
-        if isinstance(item, UserInputItem):
-            return {"role": "user", "content": item.content}
-        elif isinstance(item, MessageOutputItem):
-            if item.content:
-                if isinstance(item.content, list):
-                    return {"role": "assistant", "content": item.content}
-                elif isinstance(item.content, str):
-                    return {"role": "assistant", "content": item.content}
-                else:
-                    logger.warning(
-                        f"MessageOutputItem content is not string or list: {type(item.content)}"
-                    )
-                    return {
-                        "role": "assistant",
-                        "content": str(item.content),
-                    }
-            else:
-                return None
-        elif isinstance(item, ToolCallItem):
-            try:
-                args_str = (
-                    json.dumps(item.args_json)
-                    if isinstance(item.args_json, dict)
-                    else str(item.args_json)
-                )
-            except (TypeError, ValueError) as e:
-                logger.error(
-                    f"Could not serialize tool call args for {item.name} (id: {item.id}): {e}"
-                )
-                args_str = str(item.args_json)
-
-            return {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": item.id,
-                        "type": "function",
-                        "function": {"name": item.name, "arguments": args_str},
-                    }
-                ],
-            }
-        elif isinstance(item, ToolCallOutputItem):
-            return {
-                "role": "tool",
-                "tool_call_id": item.tool_call_id,
-                "name": item.name,
-                "content": item.content,
-            }
-        else:
-            logger.warning(
-                f"Unrecognized RunItem type for OpenAI conversion: {type(item)} in thread {self.thread_id}"
-            )
-            return None
 
     def get_history(
         self,
-        perspective_agent: Optional["Agent"] = None,
+        perspective_agent: Optional["Agent"] = None,  # Kept for future use
         max_items: Optional[int] = None,
-        max_tokens: Optional[int] = None,
     ) -> List[TResponseInputItem]:
-        """Gets the history formatted for the OpenAI API (or compatible provider).
+        """Gets the history as a list of TResponseInputItem dictionaries suitable for the Runner.
         Args:
             perspective_agent: The agent for whom the history is being prepared.
-                               (Future use for filtering based on agency_chart).
+                               (Future use for filtering).
             max_items: Optional limit on the number of recent items to include.
-            max_tokens: Optional approximate token limit for the history.
 
         Returns:
-            A list of items formatted for the model provider.
+            A list of TResponseInputItem dictionaries.
         """
         selected_items = self.items
         if max_items is not None and len(selected_items) > max_items:
@@ -172,39 +121,16 @@ class ConversationThread:
             )
             selected_items = selected_items[-max_items:]
 
-        formatted_history: List[TResponseInputItem] = []
-        current_tokens = 0
-
-        for item in reversed(selected_items):
-            converted_item = self._convert_item_to_openai_format(item)
-            if not converted_item:
-                continue
-
-            item_tokens = len(json.dumps(converted_item)) // 3
-
-            if max_tokens is not None and (current_tokens + item_tokens > max_tokens):
-                if not formatted_history:
-                    formatted_history.insert(0, converted_item)
-                    current_tokens += item_tokens
-                    logger.warning(
-                        f"First item added already exceeds token limit ({item_tokens}/{max_tokens}) in thread {self.thread_id}"
-                    )
-                else:
-                    logger.debug(
-                        f"Token limit ({max_tokens}) reached. Stopping history inclusion for thread {self.thread_id}."
-                    )
-                    break
-            else:
-                formatted_history.insert(0, converted_item)
-                current_tokens += item_tokens
+        # History is already List[TResponseInputItem]
+        formatted_history: List[TResponseInputItem] = list(selected_items)
 
         logger.debug(
-            f"Generated history with {len(formatted_history)} items, estimated {current_tokens} tokens for thread {self.thread_id}"
+            f"Generated history with {len(formatted_history)} items for thread {self.thread_id}"
         )
         return formatted_history
 
-    def get_full_log(self) -> List[RunItem]:
-        """Returns the complete, raw list of RunItems."""
+    def get_full_log(self) -> List[TResponseInputItem]:  # Return type changed
+        """Returns the complete, raw list of TResponseInputItem dictionaries."""
         return list(self.items)
 
     def __len__(self) -> int:
@@ -217,15 +143,16 @@ class ConversationThread:
         logger.info(f"Cleared items from thread {self.thread_id}")
 
 
-# Placeholder imports for callbacks
+# Placeholder imports for callbacks - Update Typehint
 ThreadLoadCallback = Callable[[str], Optional[ConversationThread]]
-ThreadSaveCallback = Callable[[ConversationThread], None]
+# Save callback expects the full dictionary of threads
+ThreadSaveCallback = Callable[[Dict[str, ConversationThread]], None]
 
 
 class ThreadManager:
     """Manages multiple ConversationThreads and persistence."""
 
-    _threads: Dict[str, ConversationThread]  # In-memory storage for now
+    _threads: Dict[str, ConversationThread]  # In-memory storage
     _load_callback: Optional[ThreadLoadCallback]
     _save_callback: Optional[ThreadSaveCallback]
 
@@ -243,38 +170,61 @@ class ThreadManager:
         """Retrieves or creates a ConversationThread.
         Handles loading from persistence if callback is provided.
         """
-        if thread_id and thread_id in self._threads:
-            logger.debug(f"Returning existing thread {thread_id} from memory.")
-            return self._threads[thread_id]
+        # Fix 1: Explicitly check type if thread_id is provided
+        if thread_id is not None and not isinstance(thread_id, str):
+            raise TypeError(f"thread_id must be a string or None, not {type(thread_id)}")
 
-        if thread_id and self._load_callback:
-            logger.debug(f"Attempting to load thread {thread_id} using callback...")
-            loaded_thread = self._load_callback(thread_id)
-            if loaded_thread:
-                logger.info(f"Successfully loaded thread {thread_id} from persistence.")
-                self._threads[thread_id] = loaded_thread
-                return loaded_thread
+        effective_thread_id = thread_id
+
+        # Fix 2: Generate ID here if None
+        if effective_thread_id is None:
+            effective_thread_id = f"as_thread_{uuid.uuid4()}"
+            logger.info(f"No thread_id provided, generated new ID: {effective_thread_id}")
+
+        if effective_thread_id in self._threads:
+            logger.debug(f"Returning existing thread {effective_thread_id} from memory.")
+            return self._threads[effective_thread_id]
+
+        # Load attempt uses effective_thread_id (which might be the generated one)
+        if self._load_callback:
+            logger.debug(f"Attempting to load thread {effective_thread_id} using callback...")
+            # Assuming load callback should only be called if an ID was initially provided
+            # or if we expect a specific generated ID format might exist.
+            # Let's refine: Only attempt load if thread_id was explicitly provided.
+            if thread_id is not None:
+                loaded_thread = self._load_callback(thread_id)  # Use original provided id for load
+                if loaded_thread:
+                    logger.info(f"Successfully loaded thread {thread_id} from persistence.")
+                    # Ensure the loaded thread uses the requested ID
+                    if loaded_thread.thread_id != thread_id:
+                        logger.warning(
+                            f"Loaded thread ID '{loaded_thread.thread_id}' differs from requested ID '{thread_id}'. Using requested ID."
+                        )
+                        loaded_thread.thread_id = thread_id
+                    self._threads[thread_id] = loaded_thread
+                    return loaded_thread
+                else:
+                    logger.warning(f"Load callback provided but failed to load thread {thread_id}.")
             else:
-                logger.warning(f"Load callback provided but failed to load thread {thread_id}.")
-                # Fall through to create a new thread
+                logger.debug("Skipping load callback as no specific thread_id was requested.")
 
-        # If no ID provided, or not in memory, or loading failed, create new
-        new_thread = ConversationThread(thread_id=thread_id)  # Pass ID if provided
-        actual_id = new_thread.thread_id  # Get potentially generated ID
-        self._threads[actual_id] = new_thread
-        logger.info(f"Created new thread: {actual_id}. Storing in memory.")
-        # Optionally save the newly created thread immediately
+        # Create new thread using the effective_thread_id (original or generated)
+        new_thread = ConversationThread(thread_id=effective_thread_id)
+        # actual_id = new_thread.thread_id # Not needed anymore as we use effective_thread_id
+        self._threads[effective_thread_id] = new_thread
+        logger.info(f"Created new thread: {effective_thread_id}. Storing in memory.")
         if self._save_callback:
+            # Save only if it was newly created (i.e., not loaded)
             self._save_thread(new_thread)
         return new_thread
 
-    def add_item_and_save(self, thread: ConversationThread, item: RunItem):
+    def add_item_and_save(self, thread: ConversationThread, item: TResponseInputItem):
         """Adds an item to the thread and triggers the save callback if configured."""
         thread.add_item(item)
         if self._save_callback:
             self._save_thread(thread)
 
-    def add_items_and_save(self, thread: ConversationThread, items: Sequence[RunItem]):
+    def add_items_and_save(self, thread: ConversationThread, items: Sequence[TResponseInputItem]):
         """Adds multiple items to the thread and triggers the save callback if configured."""
         thread.add_items(items)
         if self._save_callback:
@@ -291,20 +241,3 @@ class ThreadManager:
                 logger.error(
                     f"Error saving thread {thread.thread_id} using callback: {e}", exc_info=True
                 )
-                # Decide if this should raise an error or just log
-
-    def delete_thread(self, thread_id: str) -> bool:
-        """Deletes a thread from memory.
-        TODO: Implement deletion from persistence if needed.
-        """
-        if thread_id in self._threads:
-            del self._threads[thread_id]
-            logger.info(f"Deleted thread {thread_id} from memory.")
-            # TODO: Call persistence deletion callback if available
-            return True
-        else:
-            logger.warning(f"Attempted to delete non-existent thread {thread_id} from memory.")
-            return False
-
-
-# --- Helper Functions (Consider moving to a utils module) ---

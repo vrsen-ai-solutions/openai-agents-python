@@ -1,65 +1,127 @@
-Product Requirements Document: Agency Swarm Integration into OpenAI Agents SDK (v1.0.0)
+Product Requirements Document: Agency Swarm Integration into OpenAI Agents SDK (v2.1.0 - Agent-Centric Refined)
 
 **1. Background & Goal:**
 
-OpenAI has released its Responses API and Agents SDK. To leverage this foundation and streamline maintenance, Agency Swarm will transition from being based on the Assistants API to becoming a fork of the OpenAI Agents SDK. The primary goal is to enhance the SDK fork with Agency Swarm's robust multi-agent orchestration capabilities, making it a production-ready and user-friendly framework while ensuring a smooth migration path for existing Agency Swarm users.
+Transition Agency Swarm from an Assistants API base to a fork of the OpenAI Agents SDK. Enhance the SDK fork with Agency Swarm's multi-agent orchestration capabilities, leveraging SDK components (`Runner`, `RunContextWrapper`, `RunHooks`, `FunctionTool`) while prioritizing an agent-centric definition model and ensuring backward compatibility where feasible.
 
-**2. Core Concepts Integration:**
+**2. Core Concepts & Principles:**
 
-The integration will focus on adding Agency Swarm's multi-agent communication patterns (orchestrator model via an `Agency` class) on top of the Agents SDK's existing features (like `Agent`, `Runner`, `Handoffs`, `@function_tool`).
+*   **SDK Foundation:** Utilize `agents.Runner` for execution, `RunContextWrapper` for shared state during a run, and `RunHooks` for lifecycle events (including persistence).
+*   **Agent Definition:** `agency_swarm.Agent` (extending `agents.Agent`) defines agent capabilities (instructions, tools, **direct subagents**).
+*   **Orchestration via Tools:** Multi-agent communication occurs via a specialized `send_message` `FunctionTool`. The tool's implementation calls the target agent using `Runner.run`, effectively orchestrating the flow.
+*   **Entry Points:** User interaction starts via `Agency.get_response`/`stream` (initial setup) or `Agent.get_response`/`stream` (general turn execution). Both ultimately delegate to `Runner.run`/`streamed`.
+*   **State Management:** Conversation history (`ConversationThread`) for each agent pair is managed by a shared `ThreadManager` instance accessed via the `RunContextWrapper`. Persistence is handled by `RunHooks` interacting with the `ThreadManager`. **History keys depend only on participant names.**
+*   **`Agency` as Builder:** The `Agency` class is a lightweight builder, responsible for defining user entry points, adding *additional* communication flows between agents, configuring agents, setting up the initial `RunContextWrapper` and `RunHooks` (including persistence via closures), and delegating the *first* call to the appropriate entry-point agent via `Runner`.
 
-**3. Key Features & Requirements:**
+**3. Key Components & Requirements:**
 
-**3.1. Research & Design Phase:**
-    *   **Research - Analyze OpenAI Agents SDK:** Thoroughly analyze `src/agents/` components (`Agent`, `Runner`, `Handoffs`, `tool.py`, `_run_impl.py`) to understand message history, execution flow, and extension points.
-    *   **Research - Analyze Agency Swarm Patterns:** Review existing Agency Swarm communication flows (especially `Thread` concept, orchestrator logic in `Agency`) from documentation (`docs-agency-swarm/core-framework/`).
-    *   **Design - Thread/History Mechanism:** Design a robust mechanism (potentially a `Thread` class or similar structure) to manage shared conversation history across multiple agent interactions within an `Agency`. Define its API and integration with the `Runner`.
-    *   **Design - Orchestrator Pattern:** Define how the `Agency` class will implement the orchestrator pattern, using the history mechanism to route messages and manage control flow between agents. Specify the logic for agent-to-agent communication (e.g., specialized tools).
-    *   **Design - Agent Class Modifications:** Detail modifications to the `agents.Agent` class, incorporating required features while maintaining compatibility.
-    *   **Design - Agency Class Modifications:** Detail the design of the new `Agency` class, outlining its role, parameters, and methods for orchestration.
+**3.1. `RunContextWrapper` & `MasterContext` Object:**
+    *   Define a `MasterContext` dataclass (or Pydantic model).
+    *   **Contents:**
+        *   `thread_manager: ThreadManager` (shared instance)
+        *   `agents: Dict[str, Agent]` (map of ALL agents registered by the Agency)
+        *   *Optional:* User-defined context fields.
+        *   *Removed:* `agency_chart`, `interaction_id`.
+    *   This `MasterContext` object is passed to `Runner.run`. `RunContextWrapper[MasterContext]` provides access within hooks and tools.
 
-**3.2. Agent Class Enhancements (`agents.Agent` fork):**
-    *   **Extend `agents.Agent`:** Create a new `agency_swarm.Agent` class inheriting from `agents.Agent`.
-    *   **Parameter Compatibility:** Preserve as many parameters from the original Agency Swarm `Agent` as feasible.
-    *   **File Handling:**
-        *   Retain helper methods for file uploads/vector store management.
-        *   Modify file/folder naming convention to embed Vector Store IDs (e.g., `./myfolder_<VECTOR_STORE_ID>`) and File IDs (`myfile_<FILE_ID>.ext`) to avoid duplicates and remove reliance on `settings.json`. Check existence based on base name.
-    *   **Tool Integration:**
-        *   Keep `ToolFactory` for schema conversion.
-        *   Retain methods for loading tools from folders.
-        *   Add seamless support for SDK's `@function_tool`.
-        *   Update `get_oai_tools` (or equivalent) to handle both formats.
-    *   **Remove Assistant API Logic:** Remove all methods related to managing OpenAI Assistants V1/V2 (fetching, updating, `settings.json`).
-    *   **New Response Methods:**
-        *   Implement `get_response(..., text_only=False)`: Synchronously calls `Runner.run_sync`. Returns the full `agents.Result` object by default, or just the final text output if `text_only=True`.
-        *   Implement `get_response_stream(...)`: Calls `Runner.run` for streaming. Yield results in a format compatible with OpenAI's streaming chunks.
-    *   **Conversation History:** Determine how to pass/manage conversation history (potentially via the new `Thread`/History mechanism) for continued interactions within `get_response`/`get_response_stream`. *Initial thought on `previous_response_id` postponed in favor of exploring full history management via `Thread`.*
-    *   **Response Validation:** Retain `response_validator` functionality.
+**3.2. `agency_swarm.Agent` (extends `agents.Agent`):**
+    *   **`__init__`:**
+        *   Accept standard SDK parameters (`name`, `instructions`, `tools`, `model`, `model_settings`, `output_type`, `handoffs`, etc.).
+        *   Accept `subagents: Optional[List[Agent]] = None`.
+        *   Accept Agency Swarm specifics: `files_folder`.
+        *   *Remove:* `response_validator` (use `OutputGuardrail`).
+        *   Initialize internal `self._subagents: Dict[str, Agent] = {}`.
+        *   If `subagents` is provided, call `self.register_subagent(sa)` for each.
+        *   Inject `ThreadManager` instance (via `_set_thread_manager` method called by `Agency`). Store as `self.thread_manager`.
+    *   **`register_subagent(self, agent: Agent)`:**
+        *   Adds `agent` to `self._subagents` keyed by name.
+        *   Ensures the `send_message` tool is added to `self.tools` if `_subagents` becomes non-empty (and the tool isn't already present). Handles potential duplicates gracefully.
+    *   **`get_response`/`stream(self, message, sender_name=None, context_override=None, hooks_override=None, ...)`**:
+        *   **Purpose:** Primary entry point for any agent turn. Prepares context/history and calls `Runner.run`.
+        *   Use injected `self.thread_manager` to get the correct `ConversationThread` for the `(self.name, sender_name)` pair. **Keying relies only on participant names relative to this Agency instance's lifetime.**
+        *   Add incoming `message` to this thread.
+        *   Prepare `history_for_runner` from the thread.
+        *   Prepare final `context_object` (ensure `thread_manager`, `agents` map etc. are present from `context_override` or create default) and `hooks` (from `hooks_override`).
+        *   Call `await Runner.run(starting_agent=self, input=history_for_runner, context=context_object, hooks=hooks, ...)`
+        *   Return `RunResult` or yield stream.
+    *   **File Handling:** Implement `files_folder` logic, `_init_file_handling`, `upload_file`, `check_file_exists` using naming conventions (`folder_<VS_ID>`, `file_<FILE_ID>.ext`) to manage persistence without `settings.json`. Ensure `FileSearchTool` is added/configured if `files_folder` implies a Vector Store.
+    *   **Tools:** Standard SDK tool list. Includes `send_message` if `_subagents` is not empty.
 
-**3.3. Agency Class (New):**
-    *   **Parameter Compatibility:** Define constructor parameters, keeping similarity to original Agency Swarm `Agency` where possible.
-    *   **Agent Management:** Manage a collection of `agency_swarm.Agent` instances.
-    *   **Orchestration Logic:** Implement the core orchestrator pattern.
-    *   **Agency Chart:** Retain the `agency_chart` concept for defining agent relationships and communication paths.
-    *   **History Management:** Use the designed `Thread`/History mechanism to manage state and message history between agents involved in an interaction (replacing `agents_and_threads`).
-    *   **Communication Tools:**
-        *   Adapt `_create_special_tools` / `_create_send_message_tool`.
-        *   These tools, when called by an agent, should trigger the `Agency`'s orchestration logic to route the message to the target agent using the shared history mechanism (e.g., calling `target_agent.get_response` with the appropriate history context).
-    *   **Agency-Level Response Methods:**
-        *   Implement `get_response(..., recipient_agent, text_only=False)`: Initiates an interaction, potentially starting with `recipient_agent`. Manages the multi-agent flow. Returns the final `agents.Result` or text.
-        *   Implement `get_response_stream(..., recipient_agent)`: Similar to `get_response` but streams the output chunks from the agents involved.
-    *   **Backward Compatibility:** Implement `get_completion` and `get_completion_stream` methods mapping to the new `get_response` methods (excluding deprecated `yield_messages`).
-    *   **Demo Functionality:** Re-implement `demo_gradio` and `run_demo`. Refactor the output handling (`MessageOutput` class) to accept and display data in a format closer to the `agents.Result` structure or standard OpenAI message objects, clearly indicating the source agent.
+**3.3. `Agency` Class:**
+    *   **Role:** Lightweight builder, configurator, defines user entry points and *additional* communication flows, sets up shared context.
+    *   **`__init__`:**
+        *   Signature: `Agency(entry_points: List[Agent], communication_flows: Optional[List[Tuple[Agent, Agent]]] = None, shared_instructions_path: Optional[str] = None, send_message_tool_override: Optional[FunctionTool] = None, load_callback = None, save_callback = None)`
+        *   **Callbacks:** `load_callback`, `save_callback` must be **closures** capturing any necessary external context (like a user session ID or `chat_id`).
+        *   Instantiate `ThreadManager`.
+        *   Create `PersistenceHooks` instance internally if callbacks provided, passing the closures.
+        *   Initialize `self.agents: Dict[str, Agent] = {}`.
+        *   Register agents: Recursively find all unique agents from `entry_points`, `communication_flows`, and their predefined `subagents`. Store in `self.agents`.
+        *   Process `communication_flows`: For each `(sender, receiver)` tuple, call `sender.register_subagent(receiver)`.
+        *   Create/get the `send_message` tool instance (use override if provided). Tool should have a generic description.
+        *   Add `send_message` tool ONCE to each agent in `self.agents` that has a non-empty `_subagents` map.
+        *   Inject shared `ThreadManager` into all agents via `_set_thread_manager`.
+        *   Apply `shared_instructions` if path provided.
+    *   **`get_response`/`stream(self, message, recipient_agent, context=None, hooks=None, ...)`**:
+        *   **Purpose:** Prepare initial context/hooks and delegate to `Runner.run` via the *first agent's* `get_response` method.
+        *   Validate `recipient_agent` is in `entry_points`.
+        *   Resolve `recipient_agent` instance.
+        *   **Prepare `MasterContext` object:** Include `self.thread_manager`, `self.agents`, merged user `context`.
+        *   **Combine Hooks:** Merges internal `PersistenceHooks` with user `hooks`.
+        *   Call `await recipient_agent.get_response(message=message, sender_name=None, context_override=master_context_object, hooks_override=combined_hooks, ...)` which internally calls `Runner.run`.
+        *   Return result.
 
-**3.4. Tracing:**
-    *   Ensure the SDK's built-in tracing works seamlessly by default for all agent interactions, including those orchestrated by the `Agency`.
-    *   Aim for a simple initialization like `agentops.init()` or similar for easy integration with external providers (Logfire, AgentOps, etc.).
+**3.4. `send_message` `FunctionTool` Implementation:**
+    *   Inherit from `agents.FunctionTool`.
+    *   **Schema:** `recipient: str`, `message: str`. Description is generic.
+    *   **`on_invoke_tool(self, wrapper: RunContextWrapper[MasterContext], recipient: str, message: str)`**:
+        *   Extract `thread_manager`, `agents` from `wrapper.context`.
+        *   Get `current_agent = wrapper.agent`.
+        *   **Validation:** Check `if recipient in current_agent._subagents:`. Return error string if invalid.
+        *   Get `target_agent = agents[recipient]` (from context).
+        *   **Call target agent's entry point, passing context/hooks:**
+          ```python
+          sub_result = await target_agent.get_response(
+              message=message,
+              sender_name=current_agent.name,
+              context_override=wrapper.context, # Pass down the master context
+              hooks_override=wrapper.hooks      # Pass down the hooks
+          )
+          ```
+        *   Extract `final_output_text` from `sub_result`.
+        *   Log communication: Get `pair_thread = thread_manager.get_thread(current_agent.name, target_agent.name)`. Add `ToolCallItem` (send) and `ToolCallOutputItem` (response text) to `pair_thread`.
+        *   Return `final_output_text`.
+
+**3.5. `ThreadManager` & `ConversationThread`:**
+    *   `ThreadManager`: Manages `_threads: Dict[str, ConversationThread]`. Key is `f"{p1}__{p2}"` (sorted names) or `f"{p1}__USER"`. Loaded/saved via `RunHooks`.
+    *   `ConversationThread`: Contains `items: List[RunItem]`.
+
+**3.6. Persistence (`PersistenceHooks` extends `agents.RunHooks`):**
+    *   Implement `on_run_start` and `on_run_end`.
+    *   These methods call the closed-over `load_callback()` and `save_callback(threads_dict)` provided during `Agency` init.
+    *   `on_run_start`: Populates `context.thread_manager._threads`.
+    *   `on_run_end`: Saves `context.thread_manager._threads`.
+    *   Attached only to the top-level `Runner.run` call initiated by `Agency`.
+
+**3.7. Tracing:**
+    *   Leverage SDK's built-in tracing (`@trace`, `agent_span`). Ensure context propagation works correctly through `send_message` tool's invocation of `target_agent.get_response` (which calls `Runner.run`).
+
+**3.8. Backward Compatibility:**
+    *   `Agency.get_completion`/`stream`: Implement as wrappers around the new `Agency.get_response`/`stream` for basic compatibility (mark as deprecated).
+    *   Tool Conversion: Note as future work (script or helper) to convert Agency Swarm `BaseTool` Pydantic models to SDK `FunctionTool`.
+
+**3.9. Cleanup:**
+    *   Remove `Agent._agency_chart_peers`, `_agency_instance`, etc.
+    *   Remove `ThreadManager.delete_thread`.
+    *   Remove verbose inline comments; keep essential ones.
 
 **4. Definition of Done:**
 
-*   Agency Swarm (`agency_swarm` package) is successfully refactored as a fork/extension of the `agents` package.
-*   Multi-agent orchestration (`Agency`, `Thread`/History) is implemented and functional.
-*   Core `Agent` features (file handling, tools, response methods) are working as specified.
-*   The framework is stable, well-documented, and includes examples.
-*   Tracing is functional and easy to configure.
-*   A clear migration guide for users of the previous Agency Swarm version is provided.
+*   `agency_swarm` package refactored as SDK fork.
+*   Multi-agent orchestration via `send_message` tool and `Runner` is functional.
+*   `Agent` and `Agency` classes implemented as per refined design, supporting both `Agent(subagents=...)` and `Agency(communication_flows=...)` definition styles.
+*   Thread management and persistence via `ThreadManager`, `RunContextWrapper`, and `RunHooks` are working.
+*   File handling in `Agent` is functional.
+*   Tracing integration is verified.
+*   Basic backward compatibility methods (`Agency.get_completion*`) exist and are marked deprecated.
+*   Code is cleaned up, documented, and includes examples demonstrating multi-agent flows.
+*   Migration guide outlined.

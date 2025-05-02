@@ -1,39 +1,48 @@
-# OpenAI Agents SDK
+# Agency Swarm SDK (Based on OpenAI Agents SDK)
 
-The OpenAI Agents SDK is a lightweight yet powerful framework for building multi-agent workflows. It is provider-agnostic, supporting the OpenAI Responses and Chat Completions APIs, as well as 100+ other LLMs.
+The Agency Swarm SDK is a framework for building robust, multi-agent workflows, based on a fork of the lightweight OpenAI Agents SDK. It enhances the base SDK with specific features for defining, orchestrating, and managing persistent conversations between multiple agents.
 
+It is provider-agnostic, supporting the OpenAI Responses and Chat Completions APIs, as well as 100+ other LLMs via the underlying SDK capabilities.
+
+<!-- TODO: Add Agency Swarm specific diagram/image -->
 <img src="https://cdn.openai.com/API/docs/images/orchestration.png" alt="Image of the Agents Tracing UI" style="max-height: 803px;">
 
 ### Core concepts:
 
-1. [**Agents**](https://openai.github.io/openai-agents-python/agents): LLMs configured with instructions, tools, guardrails, and handoffs
-2. [**Handoffs**](https://openai.github.io/openai-agents-python/handoffs/): A specialized tool call used by the Agents SDK for transferring control between agents
-3. [**Guardrails**](https://openai.github.io/openai-agents-python/guardrails/): Configurable safety checks for input and output validation
-4. [**Tracing**](https://openai.github.io/openai-agents-python/tracing/): Built-in tracking of agent runs, allowing you to view, debug and optimize your workflows
+1.  **[Agents](https://openai.github.io/openai-agents-python/agents)**: LLMs configured with instructions, tools, guardrails. In Agency Swarm, `agency_swarm.Agent` extends the base agent, managing sub-agent communication links and file handling.
+2.  **[Agency](link-to-agency-docs)**: A builder class that defines the overall structure of collaborating agents using an `agency_chart`. It registers agents, sets up communication paths (via the `send_message` tool), manages shared state (`ThreadManager`), and configures persistence.
+3.  **`agency_chart`**: A list defining the agents and allowed communication flows within an `Agency`.
+4.  **[ThreadManager & Persistence](link-to-persistence-docs)**: Manages conversation state (`ConversationThread`) for each agent interaction. Persistence is handled via `load_callback` and `save_callback` functions provided to the `Agency`.
+5.  **`send_message` Tool**: A specialized `FunctionTool` automatically added to agents, enabling them to invoke other agents they are connected to in the `agency_chart`.
+6.  **[Tools](https://openai.github.io/openai-agents-python/tools/)**: Standard SDK tools (like `FunctionTool`) used by agents to perform actions.
+7.  **[Guardrails](https://openai.github.io/openai-agents-python/guardrails/)**: Configurable safety checks for input and output validation (inherited from SDK).
+8.  **[Tracing](https://openai.github.io/openai-agents-python/tracing/)**: Built-in tracking of agent runs via the SDK, allowing viewing and debugging.
 
-Explore the [examples](examples) directory to see the SDK in action, and read our [documentation](https://openai.github.io/openai-agents-python/) for more details.
+Explore the [examples](./examples/) directory to see the SDK in action, and read our documentation (including the [Migration Guide](./docs/migration_guide.md)) for more details.
 
 ## Get started
 
-1. Set up your Python environment
+1.  Set up your Python environment
 
-```
+```bash
 python -m venv env
 source env/bin/activate
 ```
 
-2. Install Agents SDK
+2.  Install Agency Swarm SDK
 
+```bash
+# TODO: Update with actual package name
+pip install agency-swarm-sdk
 ```
-pip install openai-agents
-```
 
-For voice support, install with the optional `voice` group: `pip install 'openai-agents[voice]'`.
+<!-- For voice support, install with the optional `voice` group: `pip install 'openai-agents[voice]'` (Check if applicable). -->
 
-## Hello world example
+## Hello world example (Single Agent)
 
 ```python
-from agents import Agent, Runner
+# Demonstrates basic SDK Agent usage
+from agents import Agent, Runner # Use base SDK components
 
 agent = Agent(name="Assistant", instructions="You are a helpful assistant")
 
@@ -47,36 +56,84 @@ print(result.final_output)
 
 (_If running this, ensure you set the `OPENAI_API_KEY` environment variable_)
 
-(_For Jupyter notebook users, see [hello_world_jupyter.py](examples/basic/hello_world_jupyter.py)_)
-
-## Handoffs example
+## Agency Swarm Example (Two Agents)
 
 ```python
-from agents import Agent, Runner
 import asyncio
+from agency_swarm import Agent, Agency
+from agency_swarm.thread import ThreadManager, ConversationThread # Import thread components
+from typing import Optional
+import uuid
 
-spanish_agent = Agent(
-    name="Spanish agent",
-    instructions="You only speak Spanish.",
+# Define two agents
+agent_one = Agent(
+    name="AgentOne",
+    instructions="You are agent one. If asked about the weather, send a message to AgentTwo.",
+    # tools=[...] # send_message is added automatically by Agency if needed
 )
 
-english_agent = Agent(
-    name="English agent",
-    instructions="You only speak English",
+agent_two = Agent(
+    name="AgentTwo",
+    instructions="You are agent two. You report the weather is always sunny.",
 )
 
-triage_agent = Agent(
-    name="Triage agent",
-    instructions="Handoff to the appropriate agent based on the language of the request.",
-    handoffs=[spanish_agent, english_agent],
-)
+# Define the agency structure and communication
+# AgentOne can talk to AgentTwo
+agency_chart = [
+    agent_one,
+    agent_two,
+    [agent_one, agent_two] # Defines communication flow: agent_one -> agent_two
+]
 
+# --- Simple In-Memory Persistence Example ---
+# (Replace with file/database callbacks for real use)
+memory_threads: dict[str, ConversationThread] = {}
+
+def memory_save_callback(thread: ConversationThread):
+    print(f"[Persistence] Saving thread: {thread.thread_id}")
+    memory_threads[thread.thread_id] = thread
+
+def memory_load_callback(thread_id: str) -> Optional[ConversationThread]:
+    print(f"[Persistence] Loading thread: {thread_id}")
+    return memory_threads.get(thread_id)
+# -------------------------------------------
+
+# Create the agency
+agency = Agency(
+    agency_chart=agency_chart,
+    load_callback=memory_load_callback,
+    save_callback=memory_save_callback
+)
 
 async def main():
-    result = await Runner.run(triage_agent, input="Hola, ¿cómo estás?")
-    print(result.final_output)
-    # ¡Hola! Estoy bien, gracias por preguntar. ¿Y tú, cómo estás?
+    chat_id = f"chat_{uuid.uuid4()}"
+    print(f"--- Turn 1: Asking AgentOne about weather (ChatID: {chat_id}) ---")
+    result1 = await agency.get_response(
+        message="What is the weather like?",
+        recipient_agent="AgentOne", # Start interaction with AgentOne
+        chat_id=chat_id
+    )
+    print(f"\nFinal Output from AgentOne: {result1.final_output}")
+    # Expected: AgentOne calls send_message -> AgentTwo responds -> AgentOne returns AgentTwo's response
+    # Output should be similar to: The weather is always sunny.
 
+    print(f"\n--- Turn 2: Follow up (ChatID: {chat_id}) ---")
+    # Use the *same* chat_id to continue the conversation
+    result2 = await agency.get_response(
+        message="Thanks!",
+        recipient_agent="AgentOne", # Continue with AgentOne
+        chat_id=chat_id
+    )
+    print(f"\nFinal Output from AgentOne: {result2.final_output}")
+
+    print(f"\n--- Checking Persisted History for {chat_id} ---")
+    final_thread = memory_load_callback(chat_id)
+    if final_thread:
+        print(f"Thread {final_thread.thread_id} items:")
+        for item in final_thread.items:
+            print(f"- Role: {item.get('role')}, Content: {item.get('content')}")
+    else:
+        print("Thread not found in memory.")
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -135,6 +192,22 @@ As a result, the mental model for the agent loop is:
 
 1. If the current agent has an `output_type`, the loop runs until the agent produces structured output matching that type.
 2. If the current agent does not have an `output_type`, the loop runs until the current agent produces a message without any tool calls/handoffs.
+
+## Agency Swarm Orchestration
+
+Agency Swarm uses the `Agency` class to define and manage groups of collaborating agents. The structure and communication paths are defined in the `agency_chart`.
+
+- **Agent Registration:** Agents are automatically registered when the `Agency` is initialized based on the chart.
+- **Communication:** Agents communicate using the built-in `send_message` tool, which is automatically added to agents that have permission to talk to others (defined by `[SenderAgent, ReceiverAgent]` pairs in the chart).
+- **Entry Points:** Interactions are typically started by calling `agency.get_response()` or `agency.get_response_stream()`, targeting a specific agent designated as an entry point (though calling non-entry points is possible).
+
+## State & Persistence
+
+Conversation state is managed per interaction context (identified by `chat_id`) using `ConversationThread` objects held by a central `ThreadManager`.
+
+- **`ConversationThread`**: Stores the sequence of messages and tool interactions for a specific chat.
+- **`ThreadManager`**: Creates, retrieves, and manages `ConversationThread` instances.
+- **Persistence Callbacks:** The `Agency` accepts optional `load_callback(thread_id)` and `save_callback(thread)` functions during initialization. These functions are responsible for loading and saving `ConversationThread` state to your desired backend (e.g., files, database). If provided, they are automatically invoked at the start and end of agent runs via `PersistenceHooks`.
 
 ## Common agent patterns
 

@@ -1,522 +1,399 @@
-from __future__ import annotations
-
+# --- agency.py ---
 import logging
 import uuid
-from enum import Enum
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
+import warnings
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
-from agents import Agent as BaseAgent, FunctionTool, RunResult, TResponseInputItem
-from agents.items import MessageOutputItem
+from agents import (
+    RunHooks,
+    RunResult,
+)
 
 from .agent import Agent
-from .thread import ConversationThread, ThreadManager
+from .hooks import PersistenceHooks
+from .thread import ThreadLoadCallback, ThreadManager, ThreadSaveCallback
 
-if TYPE_CHECKING:
-    pass
-
-# Type alias for agency chart structure
-AgencyChartEntry = Union[Agent, List[Agent]]
-AgencyChart = List[AgencyChartEntry]
-
-# Placeholder for SendMessage Tool Name
-SEND_MESSAGE_TOOL_NAME = "SendMessage"
-
-# --- Logging Setup ---
+# --- Logging ---
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)  # Basic config for now
+
+# --- Type Aliases ---
+AgencyChartEntry = Agent | list[Agent]
+AgencyChart = list[AgencyChartEntry]
 
 
+# --- Agency Class --- (Tasks 12, 13, 14, 15)
 class Agency:
     """
-    Manages a collection of Agents, sets up communication paths,
-    and provides delegation methods to initiate agent interactions.
-    Does NOT handle runtime orchestration directly.
+    Orchestrates a collection of Agents defined by an agency chart.
+
+    Handles agent registration, communication setup, context management,
+    and provides entry points for initiating interactions.
     """
 
-    agents: Dict[str, Agent]  # Agent name -> Agent instance
+    agents: Dict[str, Agent]
     chart: AgencyChart
-    parsed_chart: Dict[str, List[str]]  # Parsed chart: sender_name -> list[receiver_names]
+    entry_points: List[Agent]
     thread_manager: ThreadManager
-    shared_instructions: Optional[str] = None
+    persistence_hooks: Optional[PersistenceHooks]
+    shared_instructions: Optional[str]
+    user_context: Dict[str, Any]  # Shared user context for MasterContext
 
     def __init__(
         self,
         agency_chart: AgencyChart,
-        shared_instructions_path: Optional[str] = None,
+        shared_instructions: Optional[str] = None,
+        # shared_files_path: Optional[str] = None, # Keep internal name
+        load_callback: Optional[ThreadLoadCallback] = None,
+        save_callback: Optional[ThreadSaveCallback] = None,
+        user_context: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,  # Add kwargs catcher
     ):
         """
-        Initializes the Agency.
+        Initializes the Agency object, setting up agents, threads, and core functionalities.
 
-        Args:
-            agency_chart: Defines the structure and communication paths between agents.
-                          Example: [agent1, [agent1, agent2]] means agent1 can talk to user
-                          and agent1 can send messages to agent2.
-            shared_instructions_path: Optional path to a file containing instructions
-                                       to be prepended to all agents\' system prompts.
+        Handles backward compatibility with deprecated parameters.
         """
         logger.info("Initializing Agency...")
-        self.chart = agency_chart
-        self.thread_manager = ThreadManager()  # Instantiate ThreadManager
 
-        # Load shared instructions if provided
-        if shared_instructions_path:
-            try:
-                # Basic file loading, consider error handling and encoding
-                with open(shared_instructions_path) as f:
-                    self.shared_instructions = f.read()
-                logger.info(f"Loaded shared instructions from {shared_instructions_path}")
-            except FileNotFoundError:
-                logger.warning(f"Shared instructions file not found at {shared_instructions_path}")
-                self.shared_instructions = None
-            except Exception as e:
-                logger.error(
-                    f"Error loading shared instructions from {shared_instructions_path}: {e}"
+        # --- Handle Deprecated Args ---
+        deprecated_args_used = {}
+        # Handle thread callbacks mapping
+        final_load_callback = load_callback
+        final_save_callback = save_callback
+        if "threads_callbacks" in kwargs:
+            warnings.warn(
+                "'threads_callbacks' is deprecated. Pass 'load_callback' and 'save_callback' directly.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            threads_callbacks = kwargs.pop("threads_callbacks")
+            if isinstance(threads_callbacks, dict):
+                # Only override if new callbacks weren't provided explicitly
+                if final_load_callback is None and "load" in threads_callbacks:
+                    final_load_callback = threads_callbacks["load"]
+                if final_save_callback is None and "save" in threads_callbacks:
+                    final_save_callback = threads_callbacks["save"]
+            deprecated_args_used["threads_callbacks"] = threads_callbacks
+
+        # Handle other deprecated args
+        if "shared_files" in kwargs:
+            warnings.warn(
+                "'shared_files' parameter is deprecated and shared file handling is not currently implemented.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            deprecated_args_used["shared_files"] = kwargs.pop("shared_files")
+            # self.shared_files_path = deprecated_args_used["shared_files"] # Store if needed for future impl.
+        if "async_mode" in kwargs:
+            warnings.warn(
+                "'async_mode' is deprecated. Asynchronous execution is handled by the underlying SDK.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            deprecated_args_used["async_mode"] = kwargs.pop("async_mode")
+        if "send_message_tool_class" in kwargs:
+            warnings.warn(
+                "'send_message_tool_class' is deprecated. The send_message tool is configured automatically.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            deprecated_args_used["send_message_tool_class"] = kwargs.pop("send_message_tool_class")
+        if "settings_path" in kwargs or "settings_callbacks" in kwargs:
+            warnings.warn(
+                "'settings_path' and 'settings_callbacks' are deprecated. Agency settings are no longer persisted this way.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            deprecated_args_used["settings_path"] = kwargs.pop("settings_path", None)
+            deprecated_args_used["settings_callbacks"] = kwargs.pop("settings_callbacks", None)
+        agent_level_params = [
+            "temperature",
+            "top_p",
+            "max_prompt_tokens",
+            "max_completion_tokens",
+            "truncation_strategy",
+        ]
+        for param in agent_level_params:
+            if param in kwargs:
+                warnings.warn(
+                    f"Global '{param}' on Agency is deprecated. Set '{param}' on individual Agent instances instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
                 )
-                self.shared_instructions = None
-        else:
-            self.shared_instructions = None
+                deprecated_args_used[param] = kwargs.pop(param)
 
-        # --- Agent Registration and Chart Parsing ---
-        self.agents, self.parsed_chart = self._parse_chart_and_register_agents(agency_chart)
+        # Log if any deprecated args were used
+        if deprecated_args_used:
+            logger.warning(
+                f"Deprecated Agency parameters used: {list(deprecated_args_used.keys())}"
+            )
+        # Warn about any remaining unknown kwargs
+        for key in kwargs:
+            logger.warning(f"Unknown parameter '{key}' passed to Agency constructor.")
+
+        # --- Assign Core Attributes (Use potentially mapped callbacks) ---
+        self.chart = agency_chart
+        self.shared_instructions = shared_instructions  # Direct string, no file loading here
+        self.user_context = user_context or {}
+
+        # --- Initialize Core Components (Use potentially mapped callbacks) ---
+        self.thread_manager = ThreadManager(
+            load_callback=final_load_callback, save_callback=final_save_callback
+        )
+        self.persistence_hooks = None
+        if final_load_callback and final_save_callback:
+            self.persistence_hooks = PersistenceHooks(final_load_callback, final_save_callback)
+            logger.info("Persistence hooks enabled.")
+
+        # --- Register Agents and Parse Chart ---
+        self.agents = {}
+        self.entry_points = []
+        self._parse_chart_and_register_agents(agency_chart)
         if not self.agents:
             raise ValueError("Agency chart must contain at least one agent.")
-        logger.info(f"Agency initialized with agents: {list(self.agents.keys())}")
-        logger.info(f"Parsed communication chart: {self.parsed_chart}")
+        logger.info(f"Registered agents: {list(self.agents.keys())}")
 
-        # --- Setup Communication Tools ---
-        self._setup_communication_tools()
-
-        # --- Configure Agents ---
+        # --- Configure Agents & Communication ---
         self._configure_agents()
 
-        # TODO: Implement loading/applying shared files if that parameter is added
+        # TODO: Re-evaluate shared file handling based on deprecated 'shared_files'? Maybe use files_folder?
+        # if self.shared_files_path: # Check internal var if set from deprecated param
+        #      logger.warning("Shared file handling is not yet implemented.")
+
         logger.info("Agency initialization complete.")
 
-    def _parse_chart_and_register_agents(
-        self, chart: AgencyChart
-    ) -> Tuple[Dict[str, Agent], Dict[str, List[str]]]:
-        """Parses the agency chart, registers agents, and builds communication map."""
-        agents: Dict[str, Agent] = {}
-        parsed: Dict[str, List[str]] = {}
-
-        def register_agent(agent_instance):
-            if not isinstance(agent_instance, BaseAgent):  # Check against base SDK agent type
-                raise TypeError(
-                    f"Invalid object in agency_chart: {agent_instance}. Must be an Agent instance."
-                )
-            # Ensure agent has a name before trying to use it as a key
-            agent_name = getattr(agent_instance, "name", None)
-            if not agent_name:
-                raise ValueError(f"Agent instance {agent_instance} must have a 'name' attribute.")
-
-            if agent_name in agents and id(agents[agent_name]) != id(agent_instance):
-                # Allowing same agent instance multiple times is fine, but different instances with same name is error
-                raise ValueError(
-                    f"Duplicate agent name '{agent_name}' found in agency_chart with different instances."
-                )
-            agents[agent_name] = agent_instance
+    def _parse_chart_and_register_agents(self, chart: AgencyChart) -> None:
+        """Iterates through the chart, registers unique agents, and identifies entry points."""
+        registered_agent_ids = set()
 
         for entry in chart:
-            if isinstance(entry, BaseAgent):
-                register_agent(entry)
-            elif isinstance(entry, list) and len(entry) == 2:
-                sender, receiver = entry
-                # Ensure agents have names before proceeding
-                sender_name = getattr(sender, "name", None)
-                receiver_name = getattr(receiver, "name", None)
-                if not sender_name or not receiver_name:
-                    raise ValueError(
-                        "Agents in communication pair list must have a 'name' attribute."
-                    )
+            if isinstance(entry, list) and len(entry) >= 1:
+                # Communication path or group
+                sender_agent = entry[0]
+                if not isinstance(sender_agent, Agent):
+                    raise TypeError(f"Invalid sender type in chart entry: {type(sender_agent)}")
+                if id(sender_agent) not in registered_agent_ids:
+                    self._register_agent(sender_agent)
+                    registered_agent_ids.add(id(sender_agent))
 
-                register_agent(sender)
-                register_agent(receiver)
-
-                # Add communication path
-                if sender_name not in parsed:
-                    parsed[sender_name] = []
-                if receiver_name not in parsed.get(sender_name, []):
-                    parsed[sender_name].append(receiver_name)
+                # Register receivers if it's a pair
+                if len(entry) == 2:
+                    receiver_agent = entry[1]
+                    if not isinstance(receiver_agent, Agent):
+                        raise TypeError(
+                            f"Invalid receiver type in chart entry: {type(receiver_agent)}"
+                        )
+                    if id(receiver_agent) not in registered_agent_ids:
+                        self._register_agent(receiver_agent)
+                        registered_agent_ids.add(id(receiver_agent))
+            elif isinstance(entry, Agent):
+                # Standalone agent (potential entry point)
+                if id(entry) not in registered_agent_ids:
+                    self._register_agent(entry)
+                    registered_agent_ids.add(id(entry))
+                # Standalone agents are considered entry points
+                if entry not in self.entry_points:
+                    self.entry_points.append(entry)
+                    logger.info(f"Identified agent '{entry.name}' as an entry point.")
             else:
-                raise ValueError(f"Invalid agency_chart entry type: {type(entry)}. Entry: {entry}")
+                raise ValueError(f"Invalid agency_chart entry: {entry}")
 
-        return agents, parsed
+        if not self.entry_points:
+            logger.warning(
+                "No explicit entry points identified in the agency chart. Any agent might need to be callable."
+            )
+            # If no clear entry points, maybe consider all agents as potential entry points?
+            self.entry_points = list(self.agents.values())
 
-    def _get_send_message_tool(self) -> FunctionTool:
-        """Creates the SendMessage tool definition.
-        The on_invoke implementation is a no-op as the orchestrator handles it.
-        """
-        schema = {
-            "type": "object",
-            "properties": {
-                "recipient": {
-                    "type": "string",
-                    "description": "Name of the agent to send the message to.",
-                    # TODO: Potentially add enum based on allowed recipients for the specific sender?
-                },
-                "message": {"type": "string", "description": "The message content to send."},
-            },
-            "required": ["recipient", "message"],
-        }
+    def _register_agent(self, agent: Agent):
+        """Adds a unique agent instance to the agency's agent map."""
+        agent_name = agent.name
+        if agent_name in self.agents:
+            # Should not happen if id check works in _parse_chart...
+            # but double-check name uniqueness.
+            if id(self.agents[agent_name]) != id(agent):
+                raise ValueError(f"Duplicate agent name '{agent_name}' with different instances.")
+            return  # Already registered this instance
 
-        # This function does nothing, serves only to satisfy FunctionTool requirements.
-        # The orchestrator intercepts calls to this tool name.
-        async def dummy_invoke(ctx, args_json):
-            logger.info(f"[SendMessage Tool] Invoked (handled by orchestrator). Args: {args_json}")
-            return "Message dispatch handled by agency orchestrator."
-
-        return FunctionTool(
-            name=SEND_MESSAGE_TOOL_NAME,
-            description="Sends a message to another specific agent within the agency framework.",
-            params_json_schema=schema,
-            on_invoke_tool=dummy_invoke,
-        )
-
-    def _setup_communication_tools(self) -> None:
-        """Adds the SendMessage tool to agents that are allowed to send messages."""
-        send_message_tool = self._get_send_message_tool()
-        for sender_name in self.parsed_chart:
-            if sender_name in self.agents:
-                sender_agent = self.agents[sender_name]
-                # Add the tool to the sender agent if they don't already have it
-                # Need to check by name as instances might differ if called multiple times
-                if not any(
-                    getattr(tool, "name", None) == SEND_MESSAGE_TOOL_NAME
-                    for tool in getattr(sender_agent, "tools", [])  # Use getattr for safety
-                ):
-                    # Assume sender_agent has an add_tool method
-                    if hasattr(sender_agent, "add_tool") and callable(sender_agent.add_tool):
-                        sender_agent.add_tool(send_message_tool)
-                        logger.info(f"Added SendMessage tool to agent: {sender_name}")
-                    else:
-                        logger.warning(f"Agent {sender_name} does not have an add_tool method.")
-            else:
-                logger.warning(f"Sender agent '{sender_name}' defined in chart but not registered.")
+        logger.debug(f"Registering agent: {agent_name}")
+        self.agents[agent_name] = agent
 
     def _configure_agents(self) -> None:
-        """Configures individual agents with necessary references from the agency."""
-        logger.info("Configuring agents with agency references...")
+        """Injects agency refs, thread manager, shared instructions, and send_message tool."""
+        logger.info("Configuring agents...")
+        communication_map: Dict[str, List[str]] = {agent_name: [] for agent_name in self.agents}
+        for entry in self.chart:
+            if isinstance(entry, list) and len(entry) == 2:
+                sender, receiver = entry
+                if receiver.name not in communication_map[sender.name]:
+                    communication_map[sender.name].append(receiver.name)
+
         for agent_name, agent_instance in self.agents.items():
-            # Set reference to the agency instance itself
-            if hasattr(agent_instance, "_set_agency_instance"):
-                agent_instance._set_agency_instance(self)
+            # Inject Agency and ThreadManager
+            agent_instance._set_agency_instance(self)  # Provides access to self.agents map
+            agent_instance._set_thread_manager(self.thread_manager)
+
+            # Apply shared instructions (prepend)
+            if self.shared_instructions:
+                if agent_instance.instructions:
+                    agent_instance.instructions = (
+                        self.shared_instructions + "\n\n---\n\n" + agent_instance.instructions
+                    )
+                else:
+                    agent_instance.instructions = self.shared_instructions
+                logger.debug(f"Applied shared instructions to agent: {agent_name}")
+
+            # Register subagents based on communication map and add send_message tool
+            allowed_recipients = communication_map.get(agent_name, [])
+            if allowed_recipients:
+                logger.debug(f"Agent '{agent_name}' can send messages to: {allowed_recipients}")
+                for recipient_name in allowed_recipients:
+                    if recipient_name in self.agents:
+                        # Use register_subagent which also ensures send_message tool
+                        recipient_agent = self.agents[recipient_name]
+                        agent_instance.register_subagent(recipient_agent)
+                    else:
+                        logger.error(
+                            f"Configuration Error: Agent '{agent_name}' chart allows sending to '{recipient_name}', but agent not found."
+                        )
             else:
-                logger.warning(f"Agent {agent_name} does not have _set_agency_instance method.")
+                logger.debug(
+                    f"Agent '{agent_name}' has no outgoing communication paths defined in chart."
+                )
 
-            # Inject ThreadManager reference
-            if hasattr(agent_instance, "_set_thread_manager") and hasattr(self, "thread_manager"):
-                agent_instance._set_thread_manager(self.thread_manager)
-            elif not hasattr(self, "thread_manager"):
-                # This warning shouldn't trigger now
-                logger.warning(f"Agency does not have a ThreadManager instance to inject.")
-            else:
-                logger.warning(f"Agent {agent_name} does not have _set_thread_manager method.")
-
-            # Determine allowed peers and set them
-            allowed_peers = self.parsed_chart.get(agent_name, [])
-            if hasattr(agent_instance, "_set_agency_peers"):
-                agent_instance._set_agency_peers(allowed_peers)
-                logger.debug(f"Set allowed peers for {agent_name}: {allowed_peers}")
-            else:
-                logger.warning(f"Agent {agent_name} does not have _set_agency_peers method.")
-
-            # TODO: Apply shared instructions?
-            # if self.shared_instructions:
-            #     if agent_instance.instructions:
-            #          agent_instance.instructions = self.shared_instructions + "\\n\\n---\\n\\n" + agent_instance.instructions
-            #     else:
-            #          agent_instance.instructions = self.shared_instructions
-            #     logger.debug(f"Applied shared instructions to agent: {agent_name}")
-
-    # --- Thread Management ---
-
-    def get_or_create_thread(
-        self, thread_id: Optional[str] = None
-    ) -> Tuple[str, ConversationThread]:
-        """Gets an existing thread or creates a new one using ThreadManager."""
-        # Delegate to ThreadManager
-        thread = self.thread_manager.get_thread(thread_id)
-        logger.info(f"Retrieved thread {thread.thread_id} via ThreadManager.")
-        return thread.thread_id, thread
-
-    def delete_thread(self, thread_id: str) -> bool:
-        """Deletes a conversation thread using ThreadManager."""
-        # Delegate deletion to ThreadManager
-        deleted = self.thread_manager.delete_thread(thread_id)
-        if deleted:
-            logger.info(f"Deleted thread: {thread_id}")
-        else:
-            logger.warning(f"Thread not found for deletion: {thread_id}")
-        return deleted
-
-    # --- Communication Check ---
-
-    def is_communication_allowed(self, sender_name: str, recipient_name: str) -> bool:
-        """Checks if communication is allowed based on the parsed chart."""
-        return recipient_name in self.parsed_chart.get(sender_name, [])
-
-    # --- Orchestration Methods ---
-
+    # --- Agency Interaction Methods ---
     async def get_response(
         self,
-        message: str,
+        message: Union[str, List[Dict[str, Any]]],
         recipient_agent: Union[str, Agent],
-        thread_id: Optional[str] = None,
-        text_only: bool = False,
+        chat_id: Optional[str] = None,  # If None, a new chat ID is generated
+        context_override: Optional[Dict[str, Any]] = None,
+        hooks_override: Optional[RunHooks] = None,
         **kwargs: Any,
-    ) -> Union[str, RunResult]:
-        """
-        Initiates an interaction by sending a message to the specified agent.
-        Delegates the actual execution and orchestration to the agent's get_response method.
+    ) -> RunResult:
+        """Initiates an interaction with a specified entry point agent."""
+        target_agent = self._resolve_agent(recipient_agent)
+        if target_agent not in self.entry_points:
+            logger.warning(
+                f"Recipient agent '{target_agent.name}' is not a designated entry point."
+            )
+            # Allow calling non-entry points? Or raise error?
+            # Let's allow it for now, but log a warning.
+            # raise ValueError(f"Recipient agent '{target_agent.name}' is not a designated entry point.")
 
-        Args:
-            message: The initial message content.
-            recipient_agent: The agent (instance or name) to receive the message.
-            thread_id: Optional ID of an existing thread to use.
-            text_only: If True, request only the final text output from the agent.
-            **kwargs: Additional keyword arguments to pass to the agent's get_response method.
+        effective_hooks = (
+            hooks_override or self.persistence_hooks
+        )  # Use agency persistence hooks by default
 
-        Returns:
-            The final text output (if text_only=True) or the full RunResult object
-            as returned by the agent.
-        """
-        logger.info(
-            f"Agency delegating get_response to agent: {getattr(recipient_agent, 'name', recipient_agent)} in thread: {thread_id or '(new)'}"
+        # Create or use provided chat_id
+        if not chat_id:
+            chat_id = f"chat_{uuid.uuid4()}"
+            logger.info(f"Initiating new chat with agent '{target_agent.name}', chat_id: {chat_id}")
+
+        # Delegate to the target agent's get_response method
+        return await target_agent.get_response(
+            message=message,
+            sender_name=None,  # Indicate message is from user/external
+            chat_id=chat_id,
+            context_override=context_override,
+            hooks_override=effective_hooks,
+            **kwargs,
         )
-
-        # Resolve agent instance
-        if isinstance(recipient_agent, str):
-            agent_name = recipient_agent
-            if agent_name not in self.agents:
-                error_msg = f"Recipient agent '{agent_name}' not found in this agency."
-                logger.error(error_msg)
-                raise ValueError(error_msg)
-            agent_instance = self.agents[agent_name]
-        elif isinstance(recipient_agent, Agent):
-            agent_instance = recipient_agent
-            # Ensure the instance provided is actually managed by this agency
-            if agent_instance.name not in self.agents or id(self.agents[agent_instance.name]) != id(
-                agent_instance
-            ):
-                error_msg = f"Provided agent instance '{agent_instance.name}' is not registered with this agency."
-                logger.error(error_msg)
-                raise ValueError(error_msg)
-        else:
-            raise TypeError(
-                f"Invalid type for recipient_agent: {type(recipient_agent)}. Expected str or agency_swarm.Agent."
-            )
-
-        # --- Get Thread ID (create if None) ---
-        # The agent's get_response method will handle thread creation/retrieval
-        # via the ThreadManager injected during config, so we just need the ID.
-        if not thread_id:
-            # If no thread_id provided, generate one for the agent to use/create
-            thread_id = f"as_thread_{uuid.uuid4()}"
-            logger.info(f"No thread_id provided, generated new one: {thread_id}")
-
-        # --- Direct Delegation ---
-        try:
-            result = await agent_instance.get_response(
-                message=message,
-                chat_id=thread_id,  # Pass the resolved/generated thread ID
-                sender_name=None,  # Initial call is from user/external
-                text_only=text_only,
-                **kwargs,  # Pass through any additional arguments
-            )
-            # Agent's get_response is responsible for the full orchestration
-            # and returning the appropriate type based on text_only flag.
-            return result
-        except Exception as e:
-            logger.error(
-                f"Error during delegated call to agent {agent_instance.name}.get_response: {e}",
-                exc_info=True,
-            )
-            raise  # Re-raise the exception
 
     async def get_response_stream(
         self,
-        message: str,
+        message: Union[str, List[Dict[str, Any]]],
         recipient_agent: Union[str, Agent],
-        thread_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        context_override: Optional[Dict[str, Any]] = None,
+        hooks_override: Optional[RunHooks] = None,
         **kwargs: Any,
     ) -> AsyncGenerator[Any, None]:
-        """
-        Initiates a streaming interaction with the specified agent.
-        Delegates the actual streaming execution and orchestration to the agent's
-        get_response_stream method.
+        """Initiates a streaming interaction with a specified entry point agent."""
+        target_agent = self._resolve_agent(recipient_agent)
+        if target_agent not in self.entry_points:
+            logger.warning(
+                f"Recipient agent '{target_agent.name}' is not a designated entry point."
+            )
 
-        Args:
-            message: The initial message content.
-            recipient_agent: The agent (instance or name) to receive the message.
-            thread_id: Optional ID of an existing thread to use.
-            **kwargs: Additional keyword arguments to pass to the agent's get_response_stream method.
+        effective_hooks = hooks_override or self.persistence_hooks
 
-        Yields:
-            Chunks from the agent's streaming response. The exact type depends
-            on the implementation of Agent.get_response_stream.
-        """
-        logger.info(
-            f"Agency delegating get_response_stream to agent: {getattr(recipient_agent, 'name', recipient_agent)} in thread: {thread_id or '(new)'}"
-        )
+        if not chat_id:
+            chat_id = f"chat_{uuid.uuid4()}"
+            logger.info(
+                f"Initiating new stream chat with agent '{target_agent.name}', chat_id: {chat_id}"
+            )
 
-        # Resolve agent instance (same logic as get_response)
-        if isinstance(recipient_agent, str):
-            agent_name = recipient_agent
-            if agent_name not in self.agents:
-                error_msg = f"Recipient agent '{agent_name}' not found in this agency."
-                logger.error(error_msg)
-                raise ValueError(error_msg)
-            agent_instance = self.agents[agent_name]
-        elif isinstance(recipient_agent, Agent):
-            agent_instance = recipient_agent
-            if agent_instance.name not in self.agents or id(self.agents[agent_instance.name]) != id(
-                agent_instance
-            ):
-                error_msg = f"Provided agent instance '{agent_instance.name}' is not registered with this agency."
-                logger.error(error_msg)
-                raise ValueError(error_msg)
+        # Delegate to the target agent's get_response_stream method
+        async for event in target_agent.get_response_stream(
+            message=message,
+            sender_name=None,
+            chat_id=chat_id,
+            context_override=context_override,
+            hooks_override=effective_hooks,
+            **kwargs,
+        ):
+            yield event
+
+    def _resolve_agent(self, agent_ref: Union[str, Agent]) -> Agent:
+        """Helper to get an agent instance from a name or instance."""
+        if isinstance(agent_ref, Agent):
+            # Ensure it's an agent managed by this agency instance
+            if agent_ref.name in self.agents and id(self.agents[agent_ref.name]) == id(agent_ref):
+                return agent_ref
+            else:
+                raise ValueError(f"Agent instance {agent_ref.name} is not part of this agency.")
+        elif isinstance(agent_ref, str):
+            agent_instance = self.agents.get(agent_ref)
+            if not agent_instance:
+                raise ValueError(f"Agent with name '{agent_ref}' not found in this agency.")
+            return agent_instance
         else:
-            raise TypeError(
-                f"Invalid type for recipient_agent: {type(recipient_agent)}. Expected str or agency_swarm.Agent."
-            )
+            raise TypeError("recipient_agent must be an Agent instance or agent name string.")
 
-        # --- Get Thread ID (create if None) ---
-        if not thread_id:
-            thread_id = f"as_thread_{uuid.uuid4()}"
-            logger.info(f"No thread_id provided, generated new one for stream: {thread_id}")
-
-        # --- Direct Delegation of Stream ---
-        try:
-            async for chunk in agent_instance.get_response_stream(
-                message=message,
-                chat_id=thread_id,  # Pass the resolved/generated thread ID
-                sender_name=None,  # Initial call is from user/external
-                **kwargs,  # Pass through any additional arguments
-            ):
-                yield chunk  # Yield directly from the agent's stream generator
-        except Exception as e:
-            logger.error(
-                f"Error during delegated call to agent {agent_instance.name}.get_response_stream: {e}",
-                exc_info=True,
-            )
-            # How to signal error in async generator? Re-raise? Yield specific error object?
-            # Re-raising seems most direct for now.
-            raise
-
-    # --- Backward Compatibility & Demo Methods ---
-
+    # --- Deprecated Methods ---
     async def get_completion(
         self,
         message: str,
-        message_files: Optional[List[str]] = None,
-        recipient_agent: Optional[Union[str, Agent]] = None,
-        thread_id: Optional[str] = None,
-        yield_messages: bool = False,
-    ) -> Union[str, List[Dict[str, Any]]]:
-        """(Backward Compatibility) Initiates interaction, delegates via get_response.
-
-        Args:
-            message: User message content.
-            message_files: Optional list of file paths (Note: Automatic upload not fully implemented).
-            recipient_agent: The target agent (name or instance).
-            thread_id: Optional thread ID.
-            yield_messages: If True, returns the full thread history (list of dicts) instead of just the final text.
-
-        Returns:
-            The final agent text response (str) or the full thread history (List[Dict]).
-        """
-        logger.warning(
-            "get_completion is a backward compatibility method. Use get_response for RunResult or text_only=True."
+        recipient_agent: Union[str, Agent],
+        **kwargs: Any,  # Pass through other args like chat_id, etc.
+    ) -> str:
+        """[DEPRECATED] Use get_response instead. Returns final text output."""
+        logger.warning("Method 'get_completion' is deprecated. Use 'get_response' instead.")
+        run_result = await self.get_response(
+            message=message, recipient_agent=recipient_agent, **kwargs
         )
-        if not recipient_agent:
-            raise ValueError("recipient_agent must be specified for get_completion.")
-        if message_files:
-            logger.warning(
-                "message_files parameter in get_completion is not fully supported for automatic upload yet."
-            )
-            # TODO: Consider calling agent.upload_file here first if required?
+        return run_result.final_output_text or ""
 
-        try:
-            # Call the primary agency method, requesting RunResult (text_only=False)
-            # so we can potentially return the full history if yield_messages=True.
-            result = await self.get_response(
-                message=message,
-                recipient_agent=recipient_agent,
-                thread_id=thread_id,
-                text_only=False,  # Get RunResult to access history if needed
-            )
-
-            # Handle yield_messages
-            if yield_messages:
-                logger.warning(
-                    "yield_messages=True behavior changed: Returning full thread log as list of dicts."
-                )
-                # Need thread_id from result to re-fetch thread state
-                final_thread_id = getattr(
-                    result, "thread_id", thread_id
-                )  # Get ID from result if available
-                if not final_thread_id:
-                    # This shouldn't happen if get_response worked, but handle defensively
-                    logger.error(
-                        "Could not determine thread ID to fetch history for yield_messages."
-                    )
-                    return []
-                _, final_thread = self.get_or_create_thread(final_thread_id)
-                # Assuming get_full_log returns List[RunItem]
-                # Convert RunItems to dicts for backward compatibility
-                return [item.model_dump() for item in final_thread.get_full_log()]
-            else:
-                # Default: return final text output
-                final_text = getattr(result, "final_output_text", None)  # Safely get text
-                return final_text if final_text is not None else ""
-
-        except Exception as e:
-            logger.error(f"Error during get_completion: {e}", exc_info=True)
-            return ""  # Original behavior on error?
-
-    async def get_completion_stream(
-        self,
-        message: str,
-        message_files: Optional[List[str]] = None,
-        recipient_agent: Optional[Union[str, Agent]] = None,
-        thread_id: Optional[str] = None,
+    async def stream_completion(
+        self, message: str, recipient_agent: Union[str, Agent], **kwargs: Any
     ) -> AsyncGenerator[str, None]:
-        """(Backward Compatibility) Initiates streaming interaction, delegates via get_response_stream.
-
-        Yields:
-            Text chunks (str) from the agent's response stream.
-        """
+        """[DEPRECATED] Use get_response_stream instead. Yields text chunks."""
         logger.warning(
-            "get_completion_stream is a backward compatibility method. Use get_response_stream."
+            "Method 'stream_completion' is deprecated. Use 'get_response_stream' instead."
         )
-        if not recipient_agent:
-            raise ValueError("recipient_agent must be specified for get_completion_stream.")
-        if message_files:
-            logger.warning(
-                "message_files parameter in get_completion_stream is not fully supported yet."
-            )
-            # TODO: Handle file uploads before starting stream?
+        async for event in self.get_response_stream(
+            message=message, recipient_agent=recipient_agent, **kwargs
+        ):
+            # Yield only text events for backward compatibility
+            if isinstance(event, dict) and event.get("event") == "text":
+                # Check for 'data' field for text events, fallback to 'content' if needed?
+                # For consistency with current Agent implementation (yielding {"event": "text", "data": ...})
+                # let's prioritize 'data'
+                data = event.get("data")
+                if data:
+                    yield data
 
-        try:
-            # Call the primary agency streaming method
-            async for chunk in self.get_response_stream(
-                message=message, recipient_agent=recipient_agent, thread_id=thread_id
-            ):
-                # Adapt chunk format to yield simple text strings
-                # This requires knowing Agent.get_response_stream's yield type.
-                # Simple str conversion for now, might need refinement.
-                yield str(chunk)
+    # --- Other Methods (Placeholder/Future) ---
+    def is_communication_allowed(self, sender_name: str, recipient_name: str) -> bool:
+        """Checks if direct communication is allowed based on the parsed chart."""
+        # This check is implicitly handled now by agent._subagents during send_message validation
+        # Kept here conceptually, but might not be needed externally.
+        allowed_recipients = []
+        for entry in self.chart:
+            if isinstance(entry, list) and len(entry) == 2:
+                if entry[0].name == sender_name:
+                    allowed_recipients.append(entry[1].name)
+        return recipient_name in allowed_recipients
 
-        except Exception as e:
-            logger.error(f"Error during get_completion_stream: {e}", exc_info=True)
-            yield f"Error: {e}"  # Yield error string
-
-    def run_demo(self, height=600):
-        """(Placeholder for Task 18) Runs a Gradio demo."""
-        logger.warning("run_demo functionality is not implemented yet.")
-        print("Demo functionality not available in this version.")
-
-    def demo_gradio(self, height=600):
-        """(Placeholder for Task 18) Launches a Gradio web interface for the agency."""
-        logger.warning("demo_gradio functionality is not implemented yet.")
-        print("Gradio demo functionality not available in this version.")
+    # Add run_demo, demo_gradio later if needed

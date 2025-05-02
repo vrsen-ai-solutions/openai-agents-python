@@ -1,169 +1,204 @@
-from __future__ import annotations
-
-import asyncio
 import inspect
 import json
 import logging
-import os
 import re
 import shutil
 import uuid
+import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Dict, List, Optional, Type, Union
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Union
 
 from openai import AsyncOpenAI, NotFoundError
 
 from agents import (
     Agent as BaseAgent,
-    AgentOutputSchema,
-    AgentOutputSchemaBase,
     FileSearchTool,
-    # AgentState, # Not directly used?
-    FunctionTool,
-    ModelResponse,
+    RunConfig,
+    RunHooks,
     RunItem,
     Runner,
     RunResult,
-    TContext,
     Tool,
     TResponseInputItem,
 )
 from agents.exceptions import AgentsException
 from agents.items import (
     ItemHelpers,
-    MessageOutputItem,
-    ModelResponse,
-    RunItem,
-    ToolCallItem,
-    ToolCallOutputItem,
 )
-from agents.models.interface import Model
-from agents.tool import FunctionTool
-from agents.tracing import trace
+from agents.run import DEFAULT_MAX_TURNS
+from agents.stream_events import RunItemStreamEvent
 
-# Import Agency Swarm specific concepts/helpers
-from .thread import ConversationThread, ThreadManager
+from .context import MasterContext
+from .thread import ThreadManager
+from .tools.send_message import SEND_MESSAGE_TOOL_NAME, send_message_tool
 
-# --- Logging Setup ---
 logger = logging.getLogger(__name__)
-# Configure logger if not already configured elsewhere
-# logging.basicConfig(level=logging.INFO) # Avoid double config if Agency does it
 
-# --- Constants ---
-SEND_MESSAGE_TOOL_NAME = "SendMessage"
-
-
-class ToolFactoryPlaceholder:
-    """Placeholder for ToolFactory logic."""
-
-    @staticmethod
-    def from_callable(callable_obj: Callable) -> List[FunctionTool]:
-        # TODO: Implement actual conversion logic
-        # Should inspect callable, generate schema, create FunctionTool
-        # Needs to handle @function_tool decorated functions gracefully
-        print(f"[ToolFactoryPlaceholder] Converting callable: {callable_obj.__name__}")
-        # Dummy implementation - returns empty list
-        # Check if it's already a FunctionTool implicitly via decorator?
-        if hasattr(callable_obj, "_openai_function_tool"):
-            print(f"Callable {callable_obj.__name__} seems to be an SDK @function_tool")
-            # How to get the FunctionTool instance from the decorated func?
-            # This might require changes in how @function_tool works or access
-            # to internal registry if it exists.
-            # Returning empty for now.
-            return []
-        return []
-
-    @staticmethod
-    def from_schema(schema_obj: Type) -> List[FunctionTool]:
-        # TODO: Implement actual conversion logic from Pydantic model, etc.
-        print(f"[ToolFactoryPlaceholder] Converting schema: {schema_obj.__name__}")
-        return []
-
-    @staticmethod
-    def load_tools_from_folder(folder_path: Union[str, Path]) -> List[FunctionTool]:
-        print(f"[ToolFactoryPlaceholder] Loading tools from folder: {folder_path}")
-        loaded_tools = []
-        if not os.path.isdir(folder_path):
-            print(f"Warning: Tools folder not found: {folder_path}")
-            return []
-
-        for filename in os.listdir(folder_path):
-            if filename.endswith(".py") and not filename.startswith("_"):
-                filepath = os.path.join(folder_path, filename)
-                # TODO: Implement robust loading and inspection of python modules
-                # This is complex: needs to import module safely, find relevant
-                # classes/functions/models, and convert them using from_callable/from_schema.
-                print(f"  - Found potential tool file: {filename} (Loading logic TBD)")
-                # Example conceptual call:
-                # module_tools = ToolFactoryPlaceholder.load_from_module(filepath)
-                # loaded_tools.extend(module_tools)
-                pass
-        return loaded_tools
+# --- Constants / Types ---
+# Combine old and new params for easier checking later
+AGENT_PARAMS = {
+    # New/Current
+    "files_folder",
+    "tools_folder",
+    "description",
+    "response_validator",
+    # Old/Deprecated (to check in kwargs)
+    "id",
+    "tool_resources",
+    "schemas_folder",
+    "api_headers",
+    "api_params",
+    "file_ids",
+    "reasoning_effort",
+    "validation_attempts",
+    "examples",
+    "file_search",
+    "refresh_from_id",
+    "mcp_servers",
+}
 
 
-# Use the placeholder for now
-ToolFactory = ToolFactoryPlaceholder
-
-if TYPE_CHECKING:
-    # Import Agency Swarm specific concepts/helpers (placeholders)
-    from .thread import (
-        ConversationThread,
-        ThreadManager,  # Already imported
-    )
-    # from .tools import ToolFactory # Assuming ToolFactory is adapted/kept
-
-# TODO: Define which original Agency Swarm params are kept explicitly
-# This allows for better type checking and clarity
-AGENCY_SWARM_PARAMS = ["files_folder", "tools_folder", "description", "response_validator"]
-
-
-class Agent(BaseAgent[TContext]):
+class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
     """
-    Extends the OpenAI Agents SDK's Agent class (agents.Agent)
-    with features and conventions from the Agency Swarm framework.
+    Agency Swarm Agent: Extends the base SDK Agent with capabilities for
+    multi-agent collaboration within an Agency.
 
-    This agent is designed to work within an Agency orchestrator.
+    Handles subagent registration, file management (optionally linked to Vector Stores),
+    and delegates core execution logic to the SDK's Runner.
     """
 
     # --- Agency Swarm Specific Parameters ---
-    # Define parameters specific to Agency Swarm or those we want to handle differently
     files_folder: Optional[Union[str, Path]]
-    tools_folder: Optional[Union[str, Path]]
-    description: Optional[str]  # Potentially different from handoff_description?
+    tools_folder: Optional[Union[str, Path]]  # Placeholder for future ToolFactory
+    description: Optional[str]
     response_validator: Optional[Callable[[str], bool]]
-    # Note: Add other parameters identified during design/migration
 
-    # --- Internal State/Config ---
-    _thread_manager: Optional[ThreadManager] = None  # Keep this
-    _agency_chart_peers: Optional[List[str]] = (
-        None  # Allowed agents to call via send_message, set by Agency
-    )
-    _agency_instance: Optional[Any] = None  # Reference back to Agency
-    _associated_vector_store_id: Optional[str] = None  # Added in Task 9
-    files_folder_path: Optional[Path] = None  # Added in Task 9
+    # --- Internal State ---
+    _thread_manager: Optional[ThreadManager] = None
+    _agency_instance: Optional[Any] = None  # Holds reference to parent Agency
+    _associated_vector_store_id: Optional[str] = None
+    files_folder_path: Optional[Path] = None
+    _subagents: Dict[str, "Agent"]
 
     def __init__(self, **kwargs: Any):
         """
         Initializes the Agency Swarm Agent.
 
-        Args:
-            **kwargs: Accepts parameters for both the base OpenAI Agent
-                      and Agency Swarm specific features.
+        Handles backward compatibility with deprecated parameters.
+        Separates kwargs for BaseAgent and Agency Swarm specific logic.
+        Initializes file handling and subagent dictionary.
         """
+        # --- Handle Deprecated Args ---
+        deprecated_args_used = {}
+        if "id" in kwargs:
+            warnings.warn(
+                "'id' parameter (OpenAI Assistant ID) is deprecated and no longer used for loading. Agent state is managed via PersistenceHooks.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            deprecated_args_used["id"] = kwargs.pop("id")
+        if "tool_resources" in kwargs:
+            warnings.warn(
+                "'tool_resources' is deprecated. File resources should be managed via 'files_folder' and the 'upload_file' method for Vector Stores.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            deprecated_args_used["tool_resources"] = kwargs.pop("tool_resources")
+        if "schemas_folder" in kwargs or "api_headers" in kwargs or "api_params" in kwargs:
+            warnings.warn(
+                "'schemas_folder', 'api_headers', and 'api_params' related to OpenAPI tools are deprecated. Use standard FunctionTools instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            deprecated_args_used["schemas_folder"] = kwargs.pop("schemas_folder", None)
+            deprecated_args_used["api_headers"] = kwargs.pop("api_headers", None)
+            deprecated_args_used["api_params"] = kwargs.pop("api_params", None)
+        if "file_ids" in kwargs:
+            warnings.warn(
+                "'file_ids' is deprecated. Use 'files_folder' to associate with Vector Stores or manage files via Agent methods.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            deprecated_args_used["file_ids"] = kwargs.pop("file_ids")
+        if "reasoning_effort" in kwargs:
+            warnings.warn(
+                "'reasoning_effort' is deprecated as a direct Agent parameter. Configure model settings via 'model_settings' if needed.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            deprecated_args_used["reasoning_effort"] = kwargs.pop("reasoning_effort")
+        if "validation_attempts" in kwargs:
+            val_attempts = kwargs.pop("validation_attempts")
+            warnings.warn(
+                "'validation_attempts' is deprecated. Use the 'response_validator' callback for validation logic.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if val_attempts > 1 and "response_validator" not in kwargs:
+                warnings.warn(
+                    "Using 'validation_attempts > 1' without a 'response_validator' has no effect. Implement validation logic in the callback.",
+                    UserWarning,  # Changed to UserWarning as it's about usage logic
+                    stacklevel=2,
+                )
+            deprecated_args_used["validation_attempts"] = val_attempts
+        if "examples" in kwargs:
+            examples = kwargs.pop("examples")
+            warnings.warn(
+                "'examples' parameter is deprecated. Consider incorporating examples directly into the agent's 'instructions'.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            # Attempt to prepend examples to instructions
+            if examples and isinstance(examples, list):
+                try:
+                    # Basic formatting, might need refinement
+                    examples_str = "\\n\\nExamples:\\n" + "\\n".join(
+                        f"- {json.dumps(ex)}" for ex in examples
+                    )
+                    current_instructions = kwargs.get("instructions", "")
+                    kwargs["instructions"] = current_instructions + examples_str
+                    logger.info("Prepended 'examples' content to agent instructions.")
+                except Exception as e:
+                    logger.warning(
+                        f"Could not automatically prepend 'examples' to instructions: {e}"
+                    )
+            deprecated_args_used["examples"] = examples  # Store original for logging if needed
+        if "file_search" in kwargs:
+            warnings.warn(
+                "'file_search' parameter is deprecated. FileSearchTool is added automatically if 'files_folder' indicates a Vector Store.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            deprecated_args_used["file_search"] = kwargs.pop("file_search")
+        if "refresh_from_id" in kwargs:
+            warnings.warn(
+                "'refresh_from_id' is deprecated as loading by Assistant ID is no longer supported.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            deprecated_args_used["refresh_from_id"] = kwargs.pop("refresh_from_id")
+        if "mcp_servers" in kwargs:
+            warnings.warn(
+                "'mcp_servers' is deprecated and no longer supported in this SDK version.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            deprecated_args_used["mcp_servers"] = kwargs.pop("mcp_servers")
 
-        # --- Separate Kwargs for BaseAgent and AgencySwarm Agent ---
+        # Log if any deprecated args were used
+        if deprecated_args_used:
+            logger.warning(f"Deprecated Agent parameters used: {list(deprecated_args_used.keys())}")
+
+        # --- Separate Kwargs (Existing Logic) ---
         base_agent_params = {}
-        agency_swarm_params = {}
-
-        # Get annotations from BaseAgent to identify its parameters
-        # Using inspect as BaseAgent.__annotations__ might not capture all inherited params correctly
+        agency_swarm_params = {}  # This name conflicts, rename to avoid confusion
+        current_agent_params = {}
+        # --- SDK Imports --- (Move BaseAgent signature check here)
         try:
             base_sig = inspect.signature(BaseAgent)
             base_param_names = set(base_sig.parameters.keys())
-        except (
-            ValueError
-        ):  # Might happen if BaseAgent is not a standard class/has complex metaclass
-            # Fallback or default set - adjust as needed
+        except ValueError:
+            # Fallback if signature inspection fails
             base_param_names = {
                 "name",
                 "instructions",
@@ -173,7 +208,7 @@ class Agent(BaseAgent[TContext]):
                 "model_settings",
                 "tools",
                 "mcp_servers",
-                "mcp_config",
+                "mcp_config",  # mcp params are part of BaseAgent, though maybe unused now
                 "input_guardrails",
                 "output_guardrails",
                 "output_type",
@@ -182,1066 +217,602 @@ class Agent(BaseAgent[TContext]):
                 "reset_tool_choice",
             }
 
+        # Iterate through remaining kwargs after popping deprecated ones
         for key, value in kwargs.items():
             if key in base_param_names:
                 base_agent_params[key] = value
-            # Check against explicitly defined Agency Swarm params for clarity
-            elif key in AGENCY_SWARM_PARAMS:
-                agency_swarm_params[key] = value
+            # Use the new combined set AGENT_PARAMS for current/swarm-specific params
+            elif key in {"files_folder", "tools_folder", "response_validator"}:
+                current_agent_params[key] = value
             else:
-                # Decide how to handle unknown parameters: raise error or ignore?
-                # For flexibility, maybe ignore for now, or log a warning.
-                print(f"Warning: Unknown parameter '{key}' passed to Agent constructor.")
+                # Only warn if it wasn't a handled deprecated arg
+                if key not in deprecated_args_used:
+                    logger.warning(f"Unknown parameter '{key}' passed to Agent constructor.")
 
-        # --- Initialize BaseAgent ---
+        # --- BaseAgent Init ---
+        if "description" in kwargs and "description" not in base_agent_params:
+            base_agent_params["description"] = kwargs["description"]
         if "name" not in base_agent_params:
+            # If name wasn't passed explicitly, check if it came from a deprecated 'id' load (though load is removed)
+            # For safety, require name.
             raise ValueError("Agent requires a 'name' parameter.")
-        # Ensure 'tools' list exists in base_agent_params before super().__init__
         if "tools" not in base_agent_params:
-            base_agent_params["tools"] = []  # Initialize if not provided
+            base_agent_params["tools"] = []
         elif not isinstance(base_agent_params["tools"], list):
             raise TypeError("'tools' parameter must be a list.")
-
         super().__init__(**base_agent_params)
 
-        # --- Initialize Agency Swarm Specific Attributes ---
-        # Need to access self.tools *after* super().__init__() has run
-        self.files_folder = agency_swarm_params.get("files_folder")
-        self.tools_folder = agency_swarm_params.get("tools_folder")
-        self.description = agency_swarm_params.get("description")
-        self.response_validator = agency_swarm_params.get("response_validator")
-        # ... initialize others ...
+        # --- Agency Swarm Attrs Init ---
+        # Assign from the filtered current_agent_params dict
+        self.files_folder = current_agent_params.get("files_folder")
+        self.tools_folder = current_agent_params.get(
+            "tools_folder"
+        )  # Used by _load_tools... placeholder
+        self.response_validator = current_agent_params.get("response_validator")
 
-        # --- Internal state needs to be configured, likely by the Agency ---
-        # These are typically set *after* init using setter methods by the Agency
-        self._thread_manager = None
-        self._agency_chart_peers = None
-        self._agency_instance = None
+        # --- Internal State Init ---
+        self._subagents = {}
+        # _thread_manager and _agency_instance are injected by Agency
 
-        # --- Initialization Logic (Now includes loading tools) ---
-        self._load_tools_from_folder()  # Load tools from folder now
-        self._init_file_handling()  # Call the implemented method
-        # TODO (Task 9): self._init_file_handling()
+        # --- Setup ---
+        self._load_tools_from_folder()  # Placeholder call
+        self._init_file_handling()
 
-    # --- OpenAI Client ---
-    # Helper property to get an initialized client
-    # Assumes OPENAI_API_KEY is set in the environment
+    # --- Properties --- (Example: OpenAI Client)
     @property
     def client(self) -> AsyncOpenAI:
+        """Provides access to an initialized AsyncOpenAI client."""
+        # Consider making client management more robust if needed
         if not hasattr(self, "_openai_client"):
             self._openai_client = AsyncOpenAI()
         return self._openai_client
 
-    # --- Tool Handling ---
-
-    def add_tool(self, tool_input: Union[Callable, FunctionTool, Type]) -> None:
-        """Adds a tool to the agent's list of tools.
-
-        Handles SDK FunctionTools directly and attempts to convert
-        callables or type schemas using the ToolFactory.
-        """
-        added = False
-        if isinstance(tool_input, FunctionTool):
-            if tool_input not in self.tools:
-                self.tools.append(tool_input)
-                added = True
-        elif callable(tool_input):
-            # Attempt conversion using ToolFactory
-            converted_tools = ToolFactory.from_callable(tool_input)
-            for tool in converted_tools:
-                if tool not in self.tools:
-                    self.tools.append(tool)
-                    added = True
-            # Special check needed here: if from_callable returned empty because
-            # it detected an @function_tool, how do we add the actual tool?
-            # This requires ToolFactory/decorator interaction to be resolved.
-            if not converted_tools and not added:
-                print(
-                    f"Warning: Callable '{tool_input.__name__}' could not be converted by ToolFactory (or might be an unretrievable @function_tool)."
-                )
-        elif isinstance(tool_input, type):
-            # Attempt conversion from schema using ToolFactory
-            converted_tools = ToolFactory.from_schema(tool_input)
-            for tool in converted_tools:
-                if tool not in self.tools:
-                    self.tools.append(tool)
-                    added = True
-            if not converted_tools and not added:
-                print(
-                    f"Warning: Schema type '{tool_input.__name__}' could not be converted by ToolFactory."
-                )
-        else:
-            # Check if it's any other valid SDK Tool type before raising error
-            if isinstance(tool_input, Tool):
-                if tool_input not in self.tools:
-                    self.tools.append(tool_input)  # Add other Tool types like FileSearch, etc.
-                    added = True
-            else:
-                raise ValueError(
-                    f"Unsupported tool input type: {type(tool_input)}. Expected FunctionTool, callable, schema, or other agents.Tool."
-                )
-
-        # if added:
-        #     print(f"Tool '{getattr(tool_input, '__name__', str(tool_input))}' added.") # Debug log
+    # --- Tool Management ---
+    def add_tool(self, tool: Tool) -> None:
+        """Adds a tool instance to the agent."""
+        # Simplified: Assumes tool is already a valid Tool instance
+        if not isinstance(tool, Tool):
+            raise TypeError(f"Expected an instance of agents.Tool, got {type(tool)}")
+        if tool not in self.tools:
+            self.tools.append(tool)
+            logger.debug(
+                f"Tool '{getattr(tool, 'name', '(unknown)')}' added to agent '{self.name}'"
+            )
 
     def _load_tools_from_folder(self) -> None:
-        """Loads tools from the specified tools_folder using ToolFactory."""
+        """Placeholder: Loads tools from tools_folder (future Task)."""
         if self.tools_folder:
-            try:
-                folder_path = Path(self.tools_folder).resolve()
-                print(f"Loading tools from resolved path: {folder_path}")
-                loaded_tools = ToolFactory.load_tools_from_folder(folder_path)
-                for tool in loaded_tools:
-                    if tool not in self.tools:
-                        self.tools.append(tool)
-                if loaded_tools:
-                    print(f"Loaded {len(loaded_tools)} tool(s) from {folder_path}")
-            except Exception as e:
-                print(f"Error loading tools from folder {self.tools_folder}: {e}")
-        # else:
-        #     print("No tools_folder specified.")
+            logger.warning("Tool loading from folder is not fully implemented yet.")
+            # Placeholder logic using ToolFactoryPlaceholder (replace when implemented)
+            # try:
+            #     folder_path = Path(self.tools_folder).resolve()
+            #     loaded_tools = ToolFactory.load_tools_from_folder(folder_path)
+            #     for tool in loaded_tools:
+            #         self.add_tool(tool)
+            # except Exception as e:
+            #     logger.error(f"Error loading tools from folder {self.tools_folder}: {e}")
 
-    # --- File Handling (Task 9) ---
-
-    def _init_file_handling(self) -> None:
-        """Initializes file handling logic based on files_folder parameter.
-        Creates the folder if it doesn't exist, parses Vector Store ID if present,
-        and potentially syncs local files with the associated Vector Store.
-        """
-        self._associated_vector_store_id: Optional[str] = None
-        self.files_folder_path: Optional[Path] = None  # Store the resolved Path
-
-        if self.files_folder:
-            self.files_folder_path = Path(self.files_folder).resolve()  # Resolve path early
-            folder_name = self.files_folder_path.name
-
-            # Regex to find _vs_XXX pattern at the end of the folder name
-            match = re.search(r"_vs_([a-zA-Z0-9]+)$", folder_name)
-            if match:
-                vs_id = match.group(1)
-                print(f"Folder name suggests Vector Store ID: {vs_id}")
-                # TODO: Validate VS ID exists via API? For now, assume it's correct.
-                self._associated_vector_store_id = vs_id
-                # Use the path without the VS ID suffix for local storage
-                base_folder_name = folder_name[: match.start()]
-                parent_dir = self.files_folder_path.parent
-                self.files_folder_path = parent_dir / base_folder_name  # Update path
-
-            # Ensure the local folder exists
-            self.files_folder_path.mkdir(parents=True, exist_ok=True)
-
-            if not self.files_folder_path.is_dir():
-                print(
-                    f"Warning: files_folder path exists but is not a directory: {self.files_folder_path}"
-                )
-            else:
-                print(
-                    f"File handling initialized. Agent local files folder: {self.files_folder_path}"
-                )
-                # Potentially sync local folder with VS on init? (Could be slow)
-                # asyncio.run(self._sync_local_folder_to_vs()) # Example - consider implications
-
-            # Ensure FileSearchTool is configured if VS ID is present
-            if self._associated_vector_store_id:
-                self._ensure_file_search_tool()
-        else:
-            print("No files_folder specified for this agent.")
-
-    async def _sync_local_folder_to_vs(self):
-        """(Conceptual) Uploads files from local folder that aren't in the VS."""
-        if not self.files_folder_path or not self._associated_vector_store_id:
+    # --- Subagent Management ---
+    def register_subagent(self, agent: "Agent") -> None:
+        """Registers another agent as a subagent, enabling communication via send_message tool."""
+        if not hasattr(agent, "name") or not isinstance(agent.name, str):
+            raise TypeError("Subagent must be an Agent instance with a valid name.")
+        agent_name = agent.name
+        if agent_name == self.name:
+            raise ValueError("Agent cannot register itself as a subagent.")
+        if agent_name in self._subagents:
+            logger.warning(
+                f"Agent '{agent_name}' is already registered as a subagent for '{self.name}'. Skipping."
+            )
             return
 
-        print(
-            f"Checking sync status for local folder {self.files_folder_path} and VS {self._associated_vector_store_id}"
-        )
-        try:
-            # Check if VS exists
-            try:
-                vector_store = await self.client.beta.vector_stores.retrieve(
-                    self._associated_vector_store_id
-                )
-                print(f"Found existing Vector Store: {vector_store.id}")
-            except NotFoundError:
-                print(f"Vector Store {self._associated_vector_store_id} not found. Cannot sync.")
+        self._subagents[agent_name] = agent
+        logger.info(f"Agent '{self.name}' registered subagent: '{agent_name}'")
+        self._ensure_send_message_tool()
 
-        except NotFoundError:
-            print(f"Error: Vector Store {self._associated_vector_store_id} not found during sync.")
+    def _ensure_send_message_tool(self):
+        """Ensures the functional send_message tool is added to this agent."""
+        if not any(getattr(t, "name", None) == SEND_MESSAGE_TOOL_NAME for t in self.tools):
+            logger.info(f"Adding '{SEND_MESSAGE_TOOL_NAME}' tool to agent '{self.name}'")
+            self.add_tool(send_message_tool)  # Assumes send_message_tool is imported
+
+    # --- File Handling ---
+    def _init_file_handling(self) -> None:
+        """Initializes file handling: sets up local folder and VS ID if specified."""
+        self._associated_vector_store_id = None
+        self.files_folder_path = None
+        if not self.files_folder:
+            return
+
+        try:
+            self.files_folder_path = Path(self.files_folder).resolve()
+            folder_name = self.files_folder_path.name
+            match = re.search(r"_vs_([a-zA-Z0-9\-]+)$", folder_name)
+            if match:
+                vs_id = match.group(1)
+                logger.info(f"Detected Vector Store ID '{vs_id}' in files_folder name.")
+                self._associated_vector_store_id = vs_id
+                base_folder_name = folder_name[: match.start()]
+                # Construct the base path
+                base_path = self.files_folder_path.parent / base_folder_name
+                # Create the base directory
+                base_path.mkdir(parents=True, exist_ok=True)
+                # Assign the corrected base path
+                self.files_folder_path = base_path
+            else:
+                # If no VS ID, just ensure the original path exists
+                self.files_folder_path.mkdir(parents=True, exist_ok=True)
+
+            # This log message should now show the correct path
+            logger.info(f"Agent '{self.name}' local files folder: {self.files_folder_path}")
+
+            if self._associated_vector_store_id:
+                self._ensure_file_search_tool()
         except Exception as e:
-            print(f"Error during folder sync: {e}")
+            logger.error(
+                f"Error initializing file handling for path '{self.files_folder}': {e}",
+                exc_info=True,
+            )
+            self.files_folder_path = None  # Reset on error
 
     def _ensure_file_search_tool(self):
         """Adds or updates the FileSearchTool if a VS ID is associated."""
         if not self._associated_vector_store_id:
             return
+        # Remove existing FileSearchTool(s) first to avoid duplicates/conflicts
+        self.tools = [t for t in self.tools if not isinstance(t, FileSearchTool)]
+        logger.info(f"Adding FileSearchTool for VS ID: {self._associated_vector_store_id}")
+        self.add_tool(FileSearchTool(vector_store_ids=[self._associated_vector_store_id]))
 
-        fs_tool_exists = False
-        for i, tool in enumerate(self.tools):
-            if isinstance(tool, FileSearchTool):
-                # Update existing tool if VS ID differs or not set
-                if tool.vector_store_ids != [self._associated_vector_store_id]:
-                    print(
-                        f"Updating existing FileSearchTool with VS ID: {self._associated_vector_store_id}"
-                    )
-                    self.tools[i] = FileSearchTool(
-                        vector_store_ids=[self._associated_vector_store_id]
-                    )
-                else:
-                    print("FileSearchTool already configured correctly.")
-                fs_tool_exists = True
-                break
-
-        if not fs_tool_exists:
-            print(f"Adding new FileSearchTool for VS ID: {self._associated_vector_store_id}")
-            self.add_tool(FileSearchTool(vector_store_ids=[self._associated_vector_store_id]))
-
-    async def upload_file(self, file_path: str) -> str:  # Return OpenAI File ID
-        """Uploads a file locally (if files_folder is set) following naming convention,
-        uploads the file to OpenAI, and associates it with the agent's Vector Store if configured.
-
-        Returns:
-            The OpenAI File ID (e.g., 'file-XXXXXXXX').
-
-        Raises:
-            FileNotFoundError: If the source file_path does not exist.
-            ValueError: If file upload to OpenAI fails.
-            IOError: If local file copy fails.
+    async def upload_file(self, file_path: str) -> str:
+        """Uploads a file locally (if configured) and to OpenAI assistants purpose.
+        Associates with VS if agent is configured for one.
         """
         source_path = Path(file_path)
         if not source_path.is_file():
             raise FileNotFoundError(f"Source file not found: {file_path}")
 
-        base_name = source_path.stem
-        extension = source_path.suffix
-        local_file_id_part = f"local_{uuid.uuid4()}"  # Use a distinct local ID part for clarity
+        local_upload_path = source_path  # Default to source if no local copy needed
 
-        # --- Local File Management (if files_folder is set) ---
-        local_destination_path: Optional[Path] = None
+        # Copy locally if folder is set
         if self.files_folder_path:
-            # Check local existence first using the base name only (more robust than convention)
-            # Note: This check is simplified; doesn't guarantee content match.
-            # Consider hashing if content-based duplication check is needed.
-            existing_local_file = next(
-                self.files_folder_path.glob(f"{re.escape(base_name)}_*.*"), None
-            )
+            # Simple copy, overwrites allowed for simplicity now.
+            # Could add UUID or checks if needed.
+            local_destination = self.files_folder_path / source_path.name
+            try:
+                shutil.copy2(source_path, local_destination)
+                logger.info(f"Copied file locally to {local_destination}")
+                local_upload_path = local_destination
+            except Exception as e:
+                logger.error(f"Error copying file {source_path} locally: {e}", exc_info=True)
+                # Continue with original path for OpenAI upload
 
-            if existing_local_file:
-                print(
-                    f"File with base name '{base_name}' already exists locally: {existing_local_file.name}. Reusing."
-                )
-                # TODO: Should we still upload to OpenAI if it exists locally?
-                # Yes, upload to OpenAI is the primary goal. Local is cache/reference.
-                local_destination_path = existing_local_file  # Use existing local path for upload
-            else:
-                # Construct the new local filename: basename_local_UUID.ext
-                new_filename = f"{base_name}_{local_file_id_part}{extension}"
-                local_destination_path = self.files_folder_path / new_filename
-                try:
-                    shutil.copy2(source_path, local_destination_path)  # copy2 preserves metadata
-                    print(f"File '{source_path.name}' copied locally to '{local_destination_path}'")
-                except Exception as e:
-                    print(f"Error copying file {source_path} locally: {e}")
-                    # Don't raise immediately, OpenAI upload is primary. Log and continue.
-                    # raise IOError(f"Failed to copy file locally: {e}")
-        else:
-            # No local folder, use the original source path for upload
-            local_destination_path = source_path
-
-        # --- OpenAI File Upload ---
-        print(f"Uploading file '{local_destination_path.name}' to OpenAI...")
+        # Upload to OpenAI
         try:
-            # Use 'assistants' purpose for FileSearchTool compatibility
+            logger.info(f"Uploading file '{local_upload_path.name}' to OpenAI...")
             openai_file = await self.client.files.create(
-                file=local_destination_path.open("rb"), purpose="assistants"
+                file=local_upload_path.open("rb"), purpose="assistants"
             )
-            print(f"File uploaded successfully to OpenAI. File ID: {openai_file.id}")
+            logger.info(f"Uploaded to OpenAI. File ID: {openai_file.id}")
 
-            # --- Associate with Vector Store (if applicable) ---
+            # Associate with Vector Store if needed
             if self._associated_vector_store_id:
-                print(
-                    f"Adding OpenAI file {openai_file.id} to VS {self._associated_vector_store_id}..."
-                )
                 try:
-                    # Check if file is already in the VS to avoid errors
-                    # Note: Listing all files can be slow for large VS.
-                    # Consider alternative strategies if performance is critical.
-                    vs_files = await self.client.beta.vector_stores.files.list(
-                        vector_store_id=self._associated_vector_store_id
+                    logger.info(
+                        f"Adding OpenAI file {openai_file.id} to VS {self._associated_vector_store_id}"
                     )
-                    if any(f.id == openai_file.id for f in vs_files.data):
-                        print(
-                            f"File {openai_file.id} already exists in VS {self._associated_vector_store_id}."
-                        )
-                    else:
-                        vs_file = await self.client.beta.vector_stores.files.create(
-                            vector_store_id=self._associated_vector_store_id, file_id=openai_file.id
-                        )
-                        print(
-                            f"Successfully added file {vs_file.id} to VS {vs_file.vector_store_id}."
-                        )
-                        # Ensure the FileSearchTool is up-to-date (might have been added after init)
-                        self._ensure_file_search_tool()
+                    # Check if file already exists in VS (optional, API call)
+                    # vs_files = await self.client.beta.vector_stores.files.list(vector_store_id=self._associated_vector_store_id, limit=100)
+                    # if any(f.id == openai_file.id for f in vs_files.data):
+                    #     logger.debug(f"File {openai_file.id} already in VS {self._associated_vector_store_id}.")
+                    # else:
+                    await self.client.beta.vector_stores.files.create(
+                        vector_store_id=self._associated_vector_store_id, file_id=openai_file.id
+                    )
+                    logger.info(
+                        f"Added file {openai_file.id} to VS {self._associated_vector_store_id}."
+                    )
+                    self._ensure_file_search_tool()  # Ensure tool is present after adding first file
                 except NotFoundError:
-                    print(
-                        f"Error: Vector Store {self._associated_vector_store_id} not found when trying to add file."
+                    logger.error(
+                        f"Vector Store {self._associated_vector_store_id} not found when adding file {openai_file.id}."
                     )
-                    # Should this re-raise or just warn? Warn for now.
                 except Exception as e:
-                    print(
-                        f"Error adding file {openai_file.id} to VS {self._associated_vector_store_id}: {e}"
+                    logger.error(
+                        f"Error adding file {openai_file.id} to VS {self._associated_vector_store_id}: {e}",
+                        exc_info=True,
                     )
-                    # Warn, but proceed returning the OpenAI file ID
 
-            return openai_file.id  # Return the OpenAI file ID
+            return openai_file.id
 
         except Exception as e:
-            print(f"Error uploading file {local_destination_path.name} to OpenAI: {e}")
-            raise ValueError(f"Failed to upload file to OpenAI: {e}")
+            logger.error(
+                f"Error uploading file {local_upload_path.name} to OpenAI: {e}", exc_info=True
+            )
+            raise AgentsException(f"Failed to upload file to OpenAI: {e}") from e
 
-    async def check_file_exists(
-        self, file_path: str
-    ) -> Optional[str]:  # Return OpenAI File ID if found
-        """Checks if a file with the same name has already been uploaded to OpenAI
-           files associated with this agent's Vector Store (if configured).
-           NOTE: This method is now async.
-
-        Args:
-            file_path: The path to the local file to check.
-
-        Returns:
-            The OpenAI File ID if a matching file (by name) is found in the VS, otherwise None.
-            Returns None if no Vector Store is configured for the agent.
-        """
+    async def check_file_exists(self, file_path: str) -> Optional[str]:
+        """Checks if a file with the same name exists in the associated VS."""
         if not self._associated_vector_store_id:
-            return None  # No VS configured
-
-        source_path = Path(file_path)
-        target_filename = source_path.name  # Check based on original filename in OpenAI
-
+            return None
+        target_filename = Path(file_path).name
         try:
-            # This is inefficient as it lists all files.
-            # OpenAI API doesn't currently support filtering files by name directly.
-            # Consider alternative strategies for large numbers of files (e.g., local cache/db).
-            print(
+            logger.debug(
                 f"Checking for file '{target_filename}' in VS {self._associated_vector_store_id}..."
             )
             vs_files_page = await self.client.beta.vector_stores.files.list(
-                vector_store_id=self._associated_vector_store_id,
-                limit=100,  # Adjust limit as needed, might need pagination
+                vector_store_id=self._associated_vector_store_id, limit=100
             )
-            # TODO: Implement pagination if needed
-
             for vs_file in vs_files_page.data:
-                # Need to retrieve the original filename from the File object
                 try:
                     file_object = await self.client.files.retrieve(vs_file.id)
                     if file_object.filename == target_filename:
-                        print(f"Found matching file in VS: {target_filename} (ID: {vs_file.id})")
+                        logger.debug(f"Found matching file in VS: {vs_file.id}")
                         return vs_file.id
                 except NotFoundError:
-                    print(
-                        f"Warning: File ID {vs_file.id} listed in VS {self._associated_vector_store_id} but not found in OpenAI files."
-                    )
-                except Exception as e:
-                    print(f"Error retrieving details for file {vs_file.id}: {e}")
-
-            print(f"File '{target_filename}' not found in VS {self._associated_vector_store_id}.")
+                    logger.warning(f"VS file {vs_file.id} not found in OpenAI files.")
+                except Exception as e_inner:
+                    logger.warning(f"Error retrieving details for file {vs_file.id}: {e_inner}")
             return None
         except NotFoundError:
-            print(f"Error: Vector Store {self._associated_vector_store_id} not found during check.")
+            logger.error(
+                f"Vector Store {self._associated_vector_store_id} not found during file check."
+            )
             return None
         except Exception as e:
-            print(f"Error checking file existence in VS {self._associated_vector_store_id}: {e}")
-        return None
+            logger.error(
+                f"Error checking file existence in VS {self._associated_vector_store_id}: {e}",
+                exc_info=True,
+            )
+            return None
 
-    # --- Response Handling ---
-    # These methods provide a way to run this agent standalone, outside of an Agency.
-    # For orchestrated multi-agent interactions, use Agency.run_interaction methods.
-
+    # --- Core Execution Methods ---
     async def get_response(
         self,
-        message: str,  # Initial message content
-        chat_id: str,  # Explicit chat_id for thread management
-        sender_name: Optional[str] = None,  # None if user, or name of calling agent
-        # message_files handled internally now by upload_file if needed before calling
-        run_config: Optional[Dict[str, Any]] = None,  # Keep for potential future use?
-        text_only: bool = False,
-        max_steps: Optional[int] = 25,  # Max steps for this agent's execution loop
-        # current_depth: int = 0, # Add later for recursion check
-        **kwargs: Any,  # Pass-through? Maybe remove if not used?
-    ) -> Union[str, RunResult]:
-        """Runs this agent's turn within a conversation thread, handling orchestration.
-
-        Args:
-            message: The user message input.
-            chat_id: The explicit chat_id for thread management.
-            sender_name: The name of the calling agent or None if user.
-            run_config: Optional dictionary to configure the run (maps to RunConfig object).
-            text_only: If True, return only the final text output, otherwise return the full RunResult.
-            max_steps: The maximum number of steps for this agent's execution loop.
-            **kwargs: Additional arguments passed directly to `Runner.run`.
-
-        Returns:
-            The final text output (if text_only=True) or the full RunResult object.
-        """
-        # --- Start: Refactored Orchestration Logic ---
+        message: Union[str, List[Dict[str, Any]]],  # Allow raw message or OpenAI format
+        sender_name: Optional[str] = None,
+        chat_id: Optional[str] = None,  # Made optional, Agency might manage this
+        context_override: Optional[Dict[str, Any]] = None,
+        hooks_override: Optional[RunHooks] = None,
+        run_config: Optional[RunConfig] = None,
+        **kwargs: Any,  # Pass-through to Runner
+    ) -> RunResult:
+        """Runs the agent's turn using the SDK Runner, returning the full result."""
+        # with custom_span(f"Agent Turn: {self.name}.get_response") as agent_turn_span: # Commented out tracing
+        # 1. Validate Prerequisites & Get Thread
         if not self._thread_manager:
-            raise RuntimeError(f"Agent '{self.name}' cannot execute: ThreadManager not configured.")
-        if not self._agency_instance:
-            # This check might be too strict if running standalone is sometimes ok?
-            # For now, assume orchestration requires the agency context.
-            raise RuntimeError(
-                f"Agent '{self.name}' cannot execute: Agency instance not configured."
+            raise RuntimeError(f"Agent '{self.name}' missing ThreadManager.")
+        if not self._agency_instance or not hasattr(self._agency_instance, "agents"):
+            raise RuntimeError(f"Agent '{self.name}' missing Agency instance or agents map.")
+
+        # Determine chat_id if not provided (e.g., for user interaction)
+        effective_chat_id = chat_id
+        if sender_name is None and not effective_chat_id:
+            effective_chat_id = f"chat_{uuid.uuid4()}"
+            logger.info(f"New user interaction, generated chat_id: {effective_chat_id}")
+        elif sender_name is not None and not effective_chat_id:
+            # This case should be prevented by the check below, but handle defensively
+            raise ValueError(
+                "chat_id is required for agent-to-agent communication within get_response."
             )
 
-        logger.info(f"Agent '{self.name}' starting get_response for chat_id: {chat_id}")
-        thread = self._thread_manager.get_thread(chat_id)
+        logger.info(f"Agent '{self.name}' handling get_response for chat_id: {effective_chat_id}")
+        thread = self._thread_manager.get_thread(effective_chat_id)
+        # agent_turn_span.set_attribute("chat_id", chat_id) # Commented out tracing
 
-        # Add initial message if this is the start of the interaction (sender_name is None)
-        if sender_name is None:
-            thread.add_user_message(message)
-            self._thread_manager.add_item_and_save(thread, thread.items[-1])  # Save added message
-
-        current_step = 0
-        max_steps_local = max_steps or 25  # Use provided max_steps or default
-
-        # Track items generated specifically during this agent's execution run
-        # This helps construct the final RunResult for this agent's scope
-        run_items: List[RunItem] = []
-        model_responses: List[ModelResponse] = []  # Track underlying model responses
-        final_output: Any = None
-        final_output_text: Optional[str] = None
-
-        # --- Core Agent Execution Loop ---
-        while current_step < max_steps_local:
-            current_step += 1
-            logger.info(
-                f"Agent '{self.name}' - Step {current_step}/{max_steps_local} in chat {chat_id}"
-            )
-
-            # 1. Prepare for LLM call
-            history_for_model = thread.get_history()
-            tools_for_model = await self.get_all_tools()  # Includes SendMessage if allowed
-            tool_schemas = [t.openai_schema for t in tools_for_model if hasattr(t, "openai_schema")]
-
-            # TODO: Handle model settings (self.model, self.model_settings)
-            model_to_use = self.model or "gpt-4o"  # Default if not set
-
-            # 2. Call LLM
+        # --- ADDED: Add user message to thread before run --- #
+        if sender_name is None:  # Only add if it's initial user input
             try:
-                logger.debug(f"Calling LLM ({model_to_use}) for agent '{self.name}'")
-                # Note: Need to map our history format to ChatCompletionMessageParam list
-                # The get_history method already does this conversion.
-                response = await self.client.chat.completions.create(
-                    model=model_to_use,
-                    messages=history_for_model,  # Already formatted
-                    tools=tool_schemas if tool_schemas else None,
-                    tool_choice="auto",  # Or specific choice if needed
-                    # TODO: Add temperature, max_tokens from self.model_settings?
-                )
-                model_responses.append(response)  # Track raw response
-
-                # Process response message (content, tool calls)
-                response_message = response.choices[0].message
-
-                # Create corresponding RunItems (mimicking SDK structure)
-                llm_output_items: List[RunItem] = []
-                if response_message.content:
-                    text_item = MessageOutputItem(content=response_message.content)
-                    llm_output_items.append(text_item)
-                    final_output = text_item.content  # Keep track of last text output
-                    final_output_text = text_item.content
-
-                if response_message.tool_calls:
-                    for tc in response_message.tool_calls:
-                        # Assuming all are function tools for now
-                        tool_call_item = ToolCallItem(
-                            id=tc.id,
-                            name=tc.function.name,
-                            args_raw=tc.function.arguments,  # Store raw args
-                            # Attempt to parse JSON, fallback to raw string
-                            args_json=json.loads(tc.function.arguments)
-                            if tc.function.arguments
-                            else {},
-                        )
-                        llm_output_items.append(tool_call_item)
-
-                if not llm_output_items:
-                    # Should not happen with valid API response, but handle defensively
-                    logger.warning("LLM response had no content or tool calls.")
-                    # Consider breaking or returning error?
-                    # For now, add a generic empty message to avoid loop errors
-                    llm_output_items.append(MessageOutputItem(content=""))
-
-                # Add LLM output items to thread and current run log
-                thread.add_items(llm_output_items)
-                self._thread_manager.add_items_and_save(thread, llm_output_items)  # Save changes
-                run_items.extend(llm_output_items)
-
+                items_to_add = ItemHelpers.input_to_new_input_list(message)
+                # Add items to the thread object in memory
+                # self._thread_manager.add_items_and_save(thread, items_to_add)
+                thread.add_items(items_to_add)
+                logger.debug(f"Added initial user message to thread {thread.thread_id} before run.")
             except Exception as e:
-                logger.error(f"Error calling LLM for agent '{self.name}': {e}", exc_info=True)
-                # TODO: Handle LLM error - maybe retry or return error RunResult?
-                raise AgentsException(f"LLM call failed for agent {self.name}") from e
-
-            # 3. Process Tool Calls (including SendMessage)
-            send_message_call: Optional[ToolCallItem] = None
-            standard_tool_calls: List[ToolCallItem] = []
-
-            # First, find if SendMessage was called
-            for item in llm_output_items:
-                if isinstance(item, ToolCallItem) and item.name == SEND_MESSAGE_TOOL_NAME:
-                    send_message_call = item
-                    break  # Prioritize SendMessage
-
-            # If SendMessage was not called, collect standard tool calls
-            if not send_message_call:
-                for item in llm_output_items:
-                    if isinstance(item, ToolCallItem):
-                        standard_tool_calls.append(item)
-
-            # --- Handle SendMessage (if called) --- (Correct Indentation)
-            if send_message_call:
-                logger.info(f"Agent '{self.name}' initiating SendMessage.")
-                args = send_message_call.args_json
-                recipient_name = args.get("recipient")
-                message_content = args.get("message")
-
-                is_allowed = self._agency_instance.is_communication_allowed(
-                    self.name, recipient_name
+                logger.error(
+                    f"Error processing initial input message for get_response: {e}", exc_info=True
                 )
-                recipient_agent = self._agency_instance.agents.get(recipient_name)
+        # --- END ADDED --- #
 
-                if (
-                    not recipient_name
-                    or message_content is None
-                    or not is_allowed
-                    or not recipient_agent
-                ):
-                    # Construct specific error message
-                    if not recipient_name or message_content is None:
-                        error_msg = f"SendMessage failed: Missing recipient ('{recipient_name}') or message in args: {args}"
-                    elif not is_allowed:
-                        error_msg = f"Communication DENIED: Agent '{self.name}' cannot send to '{recipient_name}'."
-                    else:  # not recipient_agent
-                        error_msg = (
-                            f"SendMessage failed: Recipient agent '{recipient_name}' not found."
-                        )
+        # 3. Prepare Context (History is handled internally by Runner now)
+        # history_for_runner = thread.get_history() # Don't need to get history here
+        master_context = self._prepare_master_context(context_override, effective_chat_id)
 
-                    logger.error(error_msg)
-                    tool_output_item = ToolCallOutputItem(
-                        tool_call_id=send_message_call.id,
-                        name=send_message_call.name,
-                        content=error_msg,
-                        is_error=True,
-                    )
-                    thread.add_item(tool_output_item)
-                    self._thread_manager.add_item_and_save(thread, tool_output_item)
-                    run_items.append(tool_output_item)
-                    # Continue loop after failed SendMessage
-                    continue
-                else:
-                    # --- Recursive Call ---
-                    logger.info(
-                        f"Agent '{self.name}' calling agent '{recipient_name}' via SendMessage."
-                    )
-                    try:
-                        recursive_result: RunResult = await recipient_agent.get_response(
-                            message=message_content,
-                            chat_id=thread.thread_id,
-                            sender_name=self.name,
-                            max_steps=max_steps_local - current_step,
-                            text_only=False,  # Always get RunResult internally
-                            # TODO: Pass current_depth+1
-                        )
+        # 4. Prepare Hooks & Config
+        hooks_to_use = hooks_override or self.hooks
+        effective_run_config = run_config or RunConfig()
 
-                        output_content = getattr(recursive_result, "final_output_text", None)
-                        if output_content is None:
-                            output_content = "(No text output from recipient)"
+        # 5. Execute via Runner
+        try:
+            logger.debug(f"Calling Runner.run for agent '{self.name}'...")
+            # Call Runner.run as a class method, passing the initial input
+            run_result: RunResult = await Runner.run(
+                starting_agent=self,
+                input=message,  # Runner handles adding this initial input
+                context=master_context,
+                hooks=hooks_to_use,
+                run_config=effective_run_config,
+                max_turns=kwargs.get("max_turns", DEFAULT_MAX_TURNS),
+                previous_response_id=kwargs.get("previous_response_id"),
+            )
+            # Log completion based on presence of final_output
+            completion_info = (
+                f"Output Type: {type(run_result.final_output).__name__}"
+                if run_result.final_output is not None
+                else "No final output"
+            )
+            logger.info(f"Runner.run completed for agent '{self.name}'. {completion_info}")
+            # ... tracing commented out ...
 
-                        tool_output_item = ToolCallOutputItem(
-                            tool_call_id=send_message_call.id,
-                            name=send_message_call.name,
-                            content=output_content,
-                        )
-                        logger.info(f"SendMessage call to '{recipient_name}' completed.")
+        except Exception as e:
+            logger.error(f"Error during Runner.run for agent '{self.name}': {e}", exc_info=True)
+            # ... tracing commented out ...
+            raise AgentsException(f"Runner execution failed for agent {self.name}") from e
 
-                    except Exception as e_recurse:
-                        error_msg = (
-                            f"Error during recursive call to agent '{recipient_name}': {e_recurse}"
-                        )
-                        logger.error(error_msg, exc_info=True)
-                        tool_output_item = ToolCallOutputItem(
-                            tool_call_id=send_message_call.id,
-                            name=send_message_call.name,
-                            content=error_msg,
-                            is_error=True,
-                        )
+        # 6. Optional: Validate Response
+        response_text_for_validation = ""
+        if run_result.new_items:
+            # Use ItemHelpers to extract text from message output items in the result
+            response_text_for_validation = ItemHelpers.text_message_outputs(run_result.new_items)
 
-                    thread.add_item(tool_output_item)
-                    self._thread_manager.add_item_and_save(thread, tool_output_item)
-                    run_items.append(tool_output_item)
-                    # After successful/failed SendMessage handling, continue the loop
-                    continue
+        if response_text_for_validation and self.response_validator:
+            if not self._validate_response(response_text_for_validation):
+                logger.warning(f"Response validation failed for agent '{self.name}'")
 
-            # --- Handle Standard Tool Calls --- (Correct Indentation)
-            elif standard_tool_calls:
-                logger.info(
-                    f"Agent '{self.name}' executing standard tools: {[tc.name for tc in standard_tool_calls]}"
-                )
-                tool_outputs_generated = False
-                for tool_call in standard_tool_calls:
-                    tool_to_execute = next(
-                        (
-                            t
-                            for t in tools_for_model
-                            if hasattr(t, "name") and t.name == tool_call.name
-                        ),
-                        None,
-                    )
-                    output_content = ""
-                    is_error = False
+        # 7. Add final result items to thread
+        if self._thread_manager and run_result.new_items:
+            thread = self._thread_manager.get_thread(effective_chat_id)
+            items_to_save: List[TResponseInputItem] = []
+            for run_item in run_result.new_items:
+                item_dict = self._run_item_to_tresponse_input_item(run_item)
+                if item_dict:
+                    items_to_save.append(item_dict)
+            if items_to_save:
+                self._thread_manager.add_items_and_save(thread, items_to_save)
 
-                    if not tool_to_execute or not hasattr(tool_to_execute, "on_invoke_tool"):
-                        error_msg = f"Tool '{tool_call.name}' not found or not executable."
-                        logger.error(error_msg)
-                        output_content = error_msg
-                        is_error = True
-                    else:
-                        try:
-                            logger.debug(
-                                f"Executing tool: {tool_call.name} with args: {tool_call.args_json}"
-                            )
-                            if asyncio.iscoroutinefunction(tool_to_execute.on_invoke_tool):
-                                output_content = await tool_to_execute.on_invoke_tool(
-                                    None, tool_call.args_json
-                                )
-                            else:
-                                output_content = tool_to_execute.on_invoke_tool(
-                                    None, tool_call.args_json
-                                )
-                            is_error = False
-                            logger.debug(f"Tool '{tool_call.name}' execution successful.")
-                        except Exception as e_tool:
-                            error_msg = f"Error executing tool '{tool_call.name}': {e_tool}"
-                            logger.error(error_msg, exc_info=True)
-                            output_content = error_msg
-                            is_error = True
-
-                    tool_output_item = ToolCallOutputItem(
-                        tool_call_id=tool_call.id,
-                        name=tool_call.name,
-                        content=str(output_content),  # Ensure content is string
-                        is_error=is_error,
-                    )
-                    thread.add_item(tool_output_item)
-                    self._thread_manager.add_item_and_save(thread, tool_output_item)
-                    run_items.append(tool_output_item)
-                    tool_outputs_generated = True
-
-                # If standard tools were executed, continue the loop to process their output
-                if tool_outputs_generated:
-                    continue
-
-            # --- No Tool Calls were made by LLM this step --- (Correct Indentation)
-            else:
-                if final_output_text is not None:
-                    logger.info(f"Agent '{self.name}' produced final text output. Ending loop.")
-                    break  # Exit the while loop
-                else:
-                    logger.warning(
-                        f"Agent '{self.name}' finished step {current_step} with no text or tool calls. Breaking loop."
-                    )
-                    break  # Exit the while loop
-
-        # --- End of Loop ---
-
-        # 4. Construct Final RunResult
-        final_run_result = RunResult(
-            run_id=f"as_run_{uuid.uuid4()}",  # Generate a run ID
-            thread_id=thread.thread_id,
-            items=run_items,  # Items generated during *this specific agent run*
-            model_responses=model_responses,
-            final_output=final_output,  # Last text or final object if structured output used
-            final_output_text=final_output_text,  # Last text output
-            usage=None,  # TODO: Aggregate usage from model_responses if available
-        )
-
-        logger.info(f"Agent '{self.name}' finished get_response for chat_id: {chat_id}")
-
-        # 5. Response Validation (Using the internal helper)
-        if final_output_text is not None:
-            if not self._validate_response(final_output_text):
-                # TODO: Decide how to handle validation failure - raise error? Return specific result?
-                # Raise ValueError for now, mirroring previous conceptual logic
-                raise ValueError(f"Response validation failed for agent '{self.name}'")
-
-        # 6. Return Result
-        return final_output_text if text_only else final_run_result
-        # --- End: Refactored Orchestration Logic ---
+        # 8. Return Result
+        return run_result
 
     async def get_response_stream(
         self,
-        message: str,  # Initial message content
-        chat_id: str,  # Explicit chat_id for thread management
-        sender_name: Optional[str] = None,  # None if user, or name of calling agent
-        run_config: Optional[Dict[str, Any]] = None,  # Keep for potential future use?
-        max_steps: Optional[int] = 25,  # Max steps for this agent's execution loop
-        # current_depth: int = 0, # Add later for recursion check
-        **kwargs: Any,  # Pass-through? Maybe remove if not used?
-    ) -> AsyncGenerator[Any, None]:  # TODO: Define precise yield type (e.g., SDK StreamEvent?)
-        """Runs this agent's turn within a thread, yielding streaming events."""
-        # --- Start: Streaming Orchestration Logic ---
+        message: Union[str, List[Dict[str, Any]]],
+        sender_name: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        context_override: Optional[Dict[str, Any]] = None,
+        hooks_override: Optional[RunHooks] = None,
+        run_config: Optional[RunConfig] = None,
+        **kwargs: Any,
+    ) -> AsyncGenerator[Any, None]:
+        """Runs the agent's turn using the SDK Runner, yielding stream events."""
+        # ... initial setup and validation ...
         if not self._thread_manager:
-            raise RuntimeError(f"Agent '{self.name}' cannot execute: ThreadManager not configured.")
-        if not self._agency_instance:
-            raise RuntimeError(
-                f"Agent '{self.name}' cannot execute: Agency instance not configured."
-            )
+            raise RuntimeError(f"Agent '{self.name}' missing ThreadManager.")
+        # ... other checks ...
+        effective_chat_id = chat_id
+        if sender_name is None and not effective_chat_id:
+            effective_chat_id = f"chat_{uuid.uuid4()}"
+            logger.info(f"New user stream interaction, generated chat_id: {effective_chat_id}")
+        elif sender_name is not None and not effective_chat_id:
+            raise ValueError("chat_id is required for agent-to-agent stream communication.")
 
-        logger.info(f"Agent '{self.name}' starting get_response_stream for chat_id: {chat_id}")
-        thread = self._thread_manager.get_thread(chat_id)
+        logger.info(
+            f"Agent '{self.name}' handling get_response_stream for chat_id: {effective_chat_id}"
+        )
 
-        # Add initial message if this is the start of the interaction (sender_name is None)
+        # Add user message to thread *before* starting the run
+        # This assumes ThreadManager uses TResponseInputItem dicts now.
         if sender_name is None:
-            # Convert string to list of input items using helper
             try:
-                user_input_list = ItemHelpers.input_to_new_input_list(message)
-                if user_input_list:  # Ensure list is not empty
-                    user_item = user_input_list[0]  # Get the dict item
-                    thread.add_item(user_item)
-                    self._thread_manager.add_item_and_save(thread, user_item)  # Save added message
-                else:
-                    logger.warning(f"Could not convert initial user message for chat {chat_id}")
+                thread = self._thread_manager.get_thread(effective_chat_id)
+                items_to_add = ItemHelpers.input_to_new_input_list(
+                    message
+                )  # Convert string to dict list
+                thread.add_items(items_to_add)
+                self._thread_manager.add_items_and_save(thread, items_to_add)
             except Exception as e:
-                logger.error(
-                    f"Error converting initial user message for chat {chat_id}: {e}", exc_info=True
-                )
-                # Decide if we should raise or just log and continue?
-                # For now, log and continue without adding initial message
-            # yield RunItemStreamEvent(run_item=user_item) # Example yield
+                logger.error(f"Error processing input message for stream: {e}", exc_info=True)
+                yield {"error": f"Invalid input message format: {e}"}  # Yield error event
+                return  # Stop the generator
 
-        current_step = 0
-        max_steps_local = max_steps or 25
+        # history_for_runner = thread.get_history() # Not needed for Runner input
+        master_context = self._prepare_master_context(context_override, effective_chat_id)
+        hooks_to_use = hooks_override or self.hooks
+        effective_run_config = run_config or RunConfig()
+        final_result_items = []  # To capture items for saving at the end
 
-        run_items: List[RunItem] = []
-        model_responses: List[ModelResponse] = []
+        # Execute via Runner stream
+        try:
+            logger.debug(f"Calling Runner.run_streamed for agent '{self.name}'...")
+            # Use Runner.run_streamed
+            async for event in Runner.run_streamed(
+                starting_agent=self,
+                input=message,  # Runner handles adding initial input
+                context=master_context,
+                hooks=hooks_to_use,
+                run_config=effective_run_config,
+                max_turns=kwargs.get("max_turns", DEFAULT_MAX_TURNS),
+                previous_response_id=kwargs.get("previous_response_id"),
+            ):
+                yield event
+                # Collect RunItems from the stream events if needed for final processing
+                if isinstance(event, RunItemStreamEvent):
+                    final_result_items.append(event.item)
 
-        # --- Core Agent Streaming Loop ---
-        while current_step < max_steps_local:
-            current_step += 1
-            logger.info(
-                f"Agent '{self.name}' - STREAM Step {current_step}/{max_steps_local} in chat {chat_id}"
+            logger.info(f"Runner.run_streamed completed for agent '{self.name}'.")
+
+        except Exception as e:
+            logger.error(
+                f"Error during Runner.run_streamed for agent '{self.name}': {e}", exc_info=True
             )
+            # Yield an error event if streaming fails
+            yield {"error": f"Runner execution failed: {e}"}
+            # Optional: re-raise or handle differently
+            return  # Stop the generator after yielding error
 
-            # 1. Prepare for LLM call (same as non-streaming)
-            history_for_model = thread.get_history()
-            tools_for_model = await self.get_all_tools()
-            tool_schemas = [t.openai_schema for t in tools_for_model if hasattr(t, "openai_schema")]
-            model_to_use = self.model or "gpt-4o"
+        # 6. Optional: Validate Response (using collected items)
+        response_text_for_validation = ""
+        if final_result_items:
+            response_text_for_validation = ItemHelpers.text_message_outputs(final_result_items)
 
-            # 2. Call LLM (Streaming)
-            accumulated_content = ""
-            accumulated_tool_calls = []
-            current_tool_call_chunks = {}  # {tool_call_id: {"name": ..., "args": ...}}
-            try:
-                logger.debug(f"Calling LLM stream ({model_to_use}) for agent '{self.name}'")
-                stream = await self.client.chat.completions.create(
-                    model=model_to_use,
-                    messages=history_for_model,
-                    tools=tool_schemas if tool_schemas else None,
-                    tool_choice="auto",
-                    stream=True,
-                )
+        if response_text_for_validation and self.response_validator:
+            if not self._validate_response(response_text_for_validation):
+                logger.warning(f"Response validation failed for agent '{self.name}' after stream.")
 
-                # Process the stream chunks
-                async for chunk in stream:
-                    yield chunk  # Yield raw chunk for maximum compatibility?
-                    # Or process into RunItemStreamEvent?
-                    # Let's yield raw for now.
+        # 7. Add final result items to thread (using collected items)
+        if self._thread_manager and final_result_items:
+            thread = self._thread_manager.get_thread(effective_chat_id)
+            items_to_save: List[TResponseInputItem] = []
+            for run_item in final_result_items:
+                item_dict = self._run_item_to_tresponse_input_item(run_item)
+                if item_dict:
+                    items_to_save.append(item_dict)
+            if items_to_save:
+                self._thread_manager.add_items_and_save(thread, items_to_save)
 
-                    # --- Accumulate content and tool calls from chunks ---
-                    # This logic is complex and depends heavily on the chunk structure
-                    # provided by the openai client when streaming tool calls.
-                    # Placeholder logic - needs refinement based on actual stream format.
-                    delta = chunk.choices[0].delta
-                    if delta.content:
-                        accumulated_content += delta.content
-                    if delta.tool_calls:
-                        for tool_call_chunk in delta.tool_calls:
-                            idx = tool_call_chunk.index
-                            call_id = tool_call_chunk.id
-                            if call_id:
-                                if call_id not in current_tool_call_chunks:
-                                    current_tool_call_chunks[call_id] = {
-                                        "id": call_id,
-                                        "index": idx,
-                                        "name": "",
-                                        "args": "",
-                                    }
-                                if tool_call_chunk.function:
-                                    if tool_call_chunk.function.name:
-                                        current_tool_call_chunks[call_id]["name"] += (
-                                            tool_call_chunk.function.name
-                                        )
-                                    if tool_call_chunk.function.arguments:
-                                        current_tool_call_chunks[call_id]["args"] += (
-                                            tool_call_chunk.function.arguments
-                                        )
-                                # TODO: Handle other tool types if necessary
+    # --- Helper Methods ---
+    def _run_item_to_tresponse_input_item(self, item: RunItem) -> Optional[TResponseInputItem]:
+        """Converts a RunItem into the TResponseInputItem dictionary format for history.
+        Returns None if the item type shouldn't be added to history directly.
+        """
+        # Import necessary types locally within the function if needed, or ensure they are available
+        # Adjust imports based on SDK structure
+        from openai.types.responses import (
+            ResponseComputerToolCall,
+            ResponseFileSearchToolCall,
+            ResponseFunctionToolCall,
+            ResponseFunctionWebSearch,  # Removed FunctionCallOutput, ComputerCallOutput here
+        )
 
-                # Reconstruct full response items after stream ends
-                llm_output_items: List[RunItem] = []
-                if accumulated_content:
-                    text_item = MessageOutputItem(content=accumulated_content)
-                    llm_output_items.append(text_item)
+        # Import nested types from correct location
+        from openai.types.responses.response_input_item_param import (
+            ComputerCallOutput,
+            FunctionCallOutput,
+        )
 
-                for call_id, chunk_data in current_tool_call_chunks.items():
-                    # Attempt to parse args JSON
-                    try:
-                        args_json = json.loads(chunk_data["args"]) if chunk_data["args"] else {}
-                    except json.JSONDecodeError:
-                        logger.warning(
-                            f"Could not decode tool args JSON for call {call_id}: {chunk_data['args']}"
-                        )
-                        args_json = {"raw_args": chunk_data["args"]}  # Fallback
+        from agents.items import ItemHelpers, MessageOutputItem, ToolCallItem, ToolCallOutputItem
 
-                    tool_call_item = ToolCallItem(
-                        id=call_id,
-                        name=chunk_data["name"],
-                        args_raw=chunk_data["args"],
-                        args_json=args_json,
-                    )
-                    llm_output_items.append(tool_call_item)
-                    accumulated_tool_calls.append(tool_call_item)
+        if isinstance(item, MessageOutputItem):
+            # Extract text content for simplicity; complex content needs more handling
+            content = ItemHelpers.text_message_output(item)
+            return {"role": "assistant", "content": content}
 
-                # Save reconstructed items to thread
-                if llm_output_items:
-                    thread.add_items(llm_output_items)
-                    self._thread_manager.add_items_and_save(thread, llm_output_items)
-                    run_items.extend(llm_output_items)
-            except Exception as e:
-                logger.error(
-                    f"Error calling or processing LLM stream for '{self.name}': {e}", exc_info=True
-                )
-                yield {"error": str(e)}
-                raise AgentsException(f"LLM stream failed for agent {self.name}") from e
+        elif isinstance(item, ToolCallItem):
+            # Construct tool_calls list
+            tool_calls = []
+            # Handle different raw_item types within ToolCallItem
+            if isinstance(item.raw_item, ResponseFunctionToolCall):
+                # Access attributes directly from ResponseFunctionToolCall
+                call_id = getattr(item.raw_item, "call_id", None)
+                func_name = getattr(item.raw_item, "name", None)
+                func_args = getattr(item.raw_item, "arguments", None)
 
-            # Now process tool calls outside the try block
-            send_message_call: Optional[ToolCallItem] = None
-            standard_tool_calls: List[ToolCallItem] = []  # Start with empty list
-
-            # Populate standard_tool_calls from accumulated calls
-            standard_tool_calls = accumulated_tool_calls
-
-            # Check if SendMessage was called
-            send_message_call = next(
-                (tc for tc in standard_tool_calls if tc.name == SEND_MESSAGE_TOOL_NAME), None
-            )
-            if send_message_call:
-                # Remove SendMessage from standard calls if found
-                standard_tool_calls = [
-                    tc for tc in standard_tool_calls if tc.name != SEND_MESSAGE_TOOL_NAME
-                ]
-
-            # --- Handle SendMessage --- (Correct Indentation)
-            if send_message_call:
-                logger.info(f"Agent '{self.name}' STREAM initiating SendMessage.")
-                args = send_message_call.args_json
-                recipient_name = args.get("recipient")
-                message_content = args.get("message")
-
-                # Combine validation checks
-                is_allowed = self._agency_instance.is_communication_allowed(
-                    self.name, recipient_name
-                )
-                recipient_agent = self._agency_instance.agents.get(recipient_name)
-
-                if (
-                    not recipient_name
-                    or message_content is None
-                    or not is_allowed
-                    or not recipient_agent
-                ):
-                    # Construct specific error message
-                    if not recipient_name or message_content is None:
-                        error_msg = f"SendMessage failed: Missing recipient ('{recipient_name}') or message in args: {args}"
-                    elif not is_allowed:
-                        error_msg = f"Communication DENIED: Agent '{self.name}' cannot send to '{recipient_name}'."
-                    else:  # not recipient_agent
-                        error_msg = (
-                            f"SendMessage failed: Recipient agent '{recipient_name}' not found."
-                        )
-
-                    logger.error(error_msg)
-                    tool_output_item = ToolCallOutputItem(
-                        tool_call_id=send_message_call.id,
-                        name=send_message_call.name,
-                        content=error_msg,
-                        is_error=True,
-                    )
-                    thread.add_item(tool_output_item)
-                    self._thread_manager.add_item_and_save(thread, tool_output_item)
-                    run_items.append(tool_output_item)
-                    # Continue loop after failed SendMessage
-                    continue
-                else:
-                    # --- Recursive Streaming Call ---
-                    logger.info(f"Agent '{self.name}' STREAM calling agent '{recipient_name}'.")
-                    try:
-                        output_content = ""  # Reset accumulated content for sub-stream
-                        async for sub_chunk in recipient_agent.get_response_stream(
-                            message=message_content,
-                            chat_id=thread.thread_id,
-                            sender_name=self.name,
-                            max_steps=max_steps_local - current_step,
-                            # TODO: Pass depth
-                        ):
-                            yield sub_chunk  # Pass through sub-agent's stream
-                            # Accumulate final text from sub-agent if needed
-                            if isinstance(sub_chunk, dict):  # Example check for OpenAI-like chunk
-                                choices = sub_chunk.get("choices")
-                                if (
-                                    choices
-                                    and isinstance(choices, list)
-                                    and len(choices) > 0
-                                    and choices[0].get("delta")
-                                ):
-                                    delta_content = choices[0]["delta"].get("content")
-                                    if delta_content:
-                                        output_content += delta_content
-                            elif isinstance(sub_chunk, str):  # Simplistic fallback
-                                output_content += sub_chunk
-
-                        if not output_content:
-                            output_content = "(No text output from recipient stream)"
-
-                        tool_output_item = ToolCallOutputItem(
-                            tool_call_id=send_message_call.id,
-                            name=send_message_call.name,
-                            content=output_content,
-                        )
-                        logger.info(f"SendMessage STREAM call to '{recipient_name}' completed.")
-                    except Exception as e_recurse:
-                        error_msg = (
-                            f"Error during recursive stream call to '{recipient_name}': {e_recurse}"
-                        )
-                        logger.error(error_msg, exc_info=True)
-                        tool_output_item = ToolCallOutputItem(
-                            tool_call_id=send_message_call.id,
-                            name=send_message_call.name,
-                            content=error_msg,
-                            is_error=True,
-                        )
-
-                    thread.add_item(tool_output_item)
-                    self._thread_manager.add_item_and_save(thread, tool_output_item)
-                    run_items.append(tool_output_item)
-                    # After successful/failed SendMessage handling, continue the loop
-                    continue
-
-            # --- Handle Standard Tool Calls --- (Correct Indentation)
-            elif standard_tool_calls:
-                logger.info(
-                    f"Agent '{self.name}' STREAM executing standard tools: {[tc.name for tc in standard_tool_calls]}"
-                )
-                tool_outputs_generated = False
-                for tool_call in standard_tool_calls:
-                    tool_to_execute = next(
-                        (
-                            t
-                            for t in tools_for_model
-                            if hasattr(t, "name") and t.name == tool_call.name
-                        ),
-                        None,
-                    )
-                    output_content = ""
-                    is_error = False
-
-                    if not tool_to_execute or not hasattr(tool_to_execute, "on_invoke_tool"):
-                        error_msg = f"Tool '{tool_call.name}' not found or not executable."
-                        logger.error(error_msg)
-                        output_content = error_msg
-                        is_error = True
-                    else:
-                        try:
-                            logger.debug(
-                                f"Executing tool: {tool_call.name} with args: {tool_call.args_json}"
-                            )
-                            if asyncio.iscoroutinefunction(tool_to_execute.on_invoke_tool):
-                                output_content = await tool_to_execute.on_invoke_tool(
-                                    None, tool_call.args_json
-                                )
-                            else:
-                                output_content = tool_to_execute.on_invoke_tool(
-                                    None, tool_call.args_json
-                                )
-                            is_error = False
-                            logger.debug(f"Tool '{tool_call.name}' execution successful.")
-                        except Exception as e_tool:
-                            error_msg = f"Error executing tool '{tool_call.name}': {e_tool}"
-                            logger.error(error_msg, exc_info=True)
-                            output_content = error_msg
-                            is_error = True
-
-                    tool_output_item = ToolCallOutputItem(
-                        tool_call_id=tool_call.id,
-                        name=tool_call.name,
-                        content=str(output_content),
-                        is_error=is_error,
-                    )
-                    thread.add_item(tool_output_item)
-                    self._thread_manager.add_item_and_save(thread, tool_output_item)
-                    run_items.append(tool_output_item)
-                    tool_outputs_generated = True
-
-                # If standard tools were executed, continue the loop to process their output
-                if tool_outputs_generated:
-                    continue
-
-            # --- No Tool Calls were made by LLM this step --- (Correct Indentation)
-            else:
-                if accumulated_content:
-                    logger.info(
-                        f"Agent '{self.name}' STREAM produced final text output. Ending loop."
-                    )
-                    break  # Exit the while loop
-                else:
+                if not call_id or not func_name:
                     logger.warning(
-                        f"Agent '{self.name}' STREAM finished step {current_step} with no text or tool calls. Breaking loop."
+                        f"Missing call_id or name in ResponseFunctionToolCall: {item.raw_item}"
                     )
-                    break  # Exit the while loop
+                    return None
 
-        # --- End of Loop ---
-        logger.info(f"Agent '{self.name}' finished get_response_stream for chat_id: {chat_id}")
-        # TODO: Final validation for streaming? Difficult.
-        # TODO: Yield a final RunResult summary event?
-        # yield {"event": "run_complete", "final_result": ...} # Example
-        # --- End: Streaming Orchestration Logic ---
+                # Need to handle potential serialization issues with func_args
+                # It's often a string already, but might be dict/list
+                if isinstance(func_args, (dict, list)):
+                    args_str = json.dumps(func_args)
+                elif isinstance(func_args, str):
+                    args_str = func_args  # Assume it's valid JSON string if it's a string
+                else:
+                    args_str = str(func_args)  # Fallback
 
-    # --- Response Validation Hook (Conceptual) ---
+                tool_calls.append(
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": func_name, "arguments": args_str},
+                    }
+                )
+            # Add elif blocks here for other tool call types if needed
+            else:
+                logger.warning(f"Unhandled raw_item type in ToolCallItem: {type(item.raw_item)}")
+                return None  # Or handle appropriately
+
+            if tool_calls:
+                # Ensure content is None when tool_calls are present
+                return {"role": "assistant", "content": None, "tool_calls": tool_calls}
+            else:
+                return None  # No valid tool calls extracted
+
+        elif isinstance(item, ToolCallOutputItem):
+            # Construct tool call output item
+            tool_call_id = None
+            # Check structure instead of isinstance for TypedDict
+            if (
+                isinstance(item.raw_item, dict)
+                and item.raw_item.get("type") == "function_call_output"
+            ):
+                tool_call_id = item.raw_item.get("call_id")
+            # Add similar checks here if handling ComputerCallOutput, etc.
+            # elif isinstance(item.raw_item, dict) and item.raw_item.get('type') == 'computer_call_output': ...
+
+            if tool_call_id:
+                # Content should be stringified output
+                content = str(item.output)  # Use the processed output
+                return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+            else:
+                logger.warning(
+                    f"Could not determine tool_call_id for ToolCallOutputItem: {item.raw_item}"
+                )
+                return None
+
+        # Add handling for other RunItem types if needed (e.g., HandoffOutputItem?)
+        # elif isinstance(item, UserInputItem) -> Should already be handled when initially added
+
+        else:
+            logger.debug(f"Skipping RunItem type {type(item).__name__} for thread history saving.")
+            return None
+
+    def _prepare_master_context(
+        self, context_override: Optional[Dict[str, Any]], chat_id: Optional[str]
+    ) -> MasterContext:
+        """Constructs the MasterContext for the current run."""
+        if not self._agency_instance or not hasattr(self._agency_instance, "agents"):
+            raise RuntimeError("Cannot prepare context: Agency instance or agents map missing.")
+        if not self._thread_manager:
+            raise RuntimeError("Cannot prepare context: ThreadManager missing.")
+
+        # Start with base user context from agency, if it exists
+        base_user_context = getattr(self._agency_instance, "user_context", {})
+        merged_user_context = base_user_context.copy()
+        if context_override:
+            merged_user_context.update(context_override)
+
+        return MasterContext(
+            thread_manager=self._thread_manager,
+            agents=self._agency_instance.agents,
+            user_context=merged_user_context,
+            current_agent_name=self.name,
+            chat_id=chat_id,  # Pass chat_id to context
+        )
+
     def _validate_response(self, response_text: str) -> bool:
         """Internal helper to apply response validator if configured."""
-        # This method itself doesn't change, but its invocation point might
-        # primarily be within the Agency orchestrator for multi-agent flows.
         if self.response_validator:
             try:
                 is_valid = self.response_validator(response_text)
                 if not is_valid:
-                    print(f"Response validation failed for agent {self.name}")  # Log failure
+                    logger.warning(f"Response validation failed for agent {self.name}")
                 return is_valid
             except Exception as e:
-                print(f"Error during response validation for agent {self.name}: {e}")
+                logger.error(
+                    f"Error during response validation for agent {self.name}: {e}", exc_info=True
+                )
                 return False  # Treat validation errors as failure
-        return True
+        return True  # No validator means always valid
 
+    # --- Agency Configuration Methods --- (Called by Agency)
     def _set_thread_manager(self, manager: ThreadManager):
         """Allows the Agency to inject the ThreadManager instance."""
         self._thread_manager = manager
 
-    def _set_agency_peers(self, peers: List[str]):
-        """Allows the Agency to set the list of allowed communication peers."""
-        self._agency_chart_peers = peers
-
     def _set_agency_instance(self, agency: Any):
-        """Allows the Agency to inject a reference to itself."""
+        """Allows the Agency to inject a reference to itself and its agent map."""
+        if not hasattr(agency, "agents"):
+            raise TypeError("Provided agency instance must have an 'agents' dictionary.")
         self._agency_instance = agency

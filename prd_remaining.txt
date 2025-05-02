@@ -1,0 +1,85 @@
+Product Requirements Document: Agency Swarm SDK Integration - Remaining Tasks
+
+**1. Goal:**
+
+Complete the transition of Agency Swarm to the OpenAI Agents SDK fork, addressing remaining implementation details, testing gaps, documentation inaccuracies, and technical debt identified during the migration process.
+
+**2. Remaining Core Component Refinements:**
+
+**2.1. `agency_swarm.Agent`:**
+    *   **File Handling:**
+        *   Complete and thoroughly test `_init_file_handling`, `upload_file`, and `check_file_exists`.
+        *   Implement and test Vector Store ID parsing from `files_folder` name (`folder_<VS_ID>`).
+        *   Implement and test file naming conventions (`file_<FILE_ID>.ext` or `basename_<FILE_ID>.ext` - clarify and implement consistently).
+        *   Ensure `FileSearchTool` is reliably added/configured only when a Vector Store is associated or files exist.
+    *   **Streaming:** Finalize and test the `get_response_stream` method, ensuring correct event yielding and final result processing.
+    *   **Validation:** Test the `_validate_response` method and its interaction with `response_validator`.
+    *   **Deprecation:** Verify all `DeprecationWarning`s for old parameters work correctly and update documentation. Confirm `examples` parameter logic.
+
+**2.2. `Agency`:**
+    *   **Shared Instructions:** Verify shared instructions application logic in complex scenarios.
+    *   **Deprecation:** Verify all `DeprecationWarning`s for old parameters work correctly and update documentation. Re-evaluate `shared_files` concept - decide if partial functionality using `files_folder` is needed or if it should be fully removed.
+
+**2.3. `send_message` Tool:**
+    *   Test context (`MasterContext`) and hooks (`RunHooks`) propagation during the recursive `target_agent.get_response` call.
+    *   Implement robust error handling for invalid recipients and errors during the target agent's execution (address TODOs).
+    *   Verify communication logging (ToolCallItem, ToolCallOutputItem) to the correct `ConversationThread`.
+
+**2.4. Persistence (`PersistenceHooks` & `ThreadManager`):**
+    *   Develop comprehensive examples demonstrating `load_callback` and `save_callback` usage.
+    *   Test the interaction between `PersistenceHooks` (`on_run_start`, `on_run_end`) and the user-provided callbacks under various conditions (e.g., errors during load/save).
+    *   Verify thread state management, including potential implicit cleanup needs now that `delete_thread` is removed. Test `ThreadManager` methods (`get_thread`, `add_items_and_save`) thoroughly.
+
+**3. Cross-Cutting Concerns:**
+
+**3.1. Testing:**
+    *   **Review Old Tests:** Systematically review tests in `tests/old_agency_swarm_tests/` (`test_agency.py`, `test_communication.py`, `test_tool_factory.py`) and ensure essential, non-redundant test cases are reimplemented in the new test suite (`tests/`).
+    *   **Address Test TODOs:** Address all `TODO` comments in the current test files (`tests/test_agent.py`, `tests/test_agency.py`, `tests/test_thread_manager.py`, etc.).
+    *   **Core `send_message` Tool Tests (in `tests/test_agent.py` or dedicated file):**
+        *   Test successful message send/receive flow.
+        *   Test `MasterContext` and `RunHooks` propagation during recursive calls.
+        *   Test handling of invalid recipient errors.
+        *   Test handling of errors raised by the recipient agent during its execution.
+        *   Verify communication logging (`ToolCallItem`/`ToolCallOutputItem`) to `ThreadManager` (requires mocking or integration tests).
+    *   **Agent File Handling Tests (in `tests/test_agent.py`):**
+        *   Test `upload_file` (with and without VS association).
+        *   Test `check_file_exists`.
+        *   Test correct Vector Store ID parsing and association.
+        *   Test conditional addition/configuration of `FileSearchTool`.
+    *   **Persistence Interaction Tests (in `tests/test_thread_manager.py`, `tests/test_agency.py`):**
+        *   Test `PersistenceHooks` interaction with `load/save` callbacks (success and error scenarios).
+        *   Test `ThreadManager` methods (`get_thread`, `add_items_and_save`) thoroughly, including edge cases.
+    *   **Agency Initialization & Configuration Tests (in `tests/test_agency.py`):**
+        *   Reimplement critical tests from `old_agency_swarm_tests/test_agency.py` covering chart parsing, agent registration, configuration injection (ThreadManager, Agency instance), shared instructions application.
+    *   **Streaming Functionality Tests:** Add comprehensive tests for `get_response_stream`.
+    *   **Response Validation Tests:** Test `Agent._validate_response`.
+    *   **Error Handling Tests:** Add tests for error handling across various Agent and Agency methods.
+    *   **Deprecation Tests:** Add tests specifically verifying `DeprecationWarning`s are raised correctly for deprecated Agent and Agency parameters.
+
+**3.2. Documentation:**
+    *   Update `docs/migration_guide.md` based on validation findings (correct "BEFORE" examples, confirm `get_completion` usage).
+    *   Review and update all examples in the `examples/` directory to align with the latest SDK-based implementation.
+    *   Ensure all public classes and methods have accurate docstrings.
+    *   Add documentation explaining the persistence model and callback requirements.
+    *   Document all deprecated parameters and their replacements/removal.
+    *   Consider adding a note about tool conversion (script status/manual process).
+
+**3.3. Technical Debt & Cleanup:**
+    *   Address all remaining `TODO` comments identified in the codebase.
+    *   Review code for potential improvements in clarity, efficiency, or error handling.
+
+**3.4. Tracing:**
+    *   Decide on the tracing strategy: either implement tracing using SDK features (`@trace`, `agent_span`, context propagation) or remove the commented-out tracing code.
+
+**4. Definition of Done:**
+
+*   All file handling features in `Agent` are fully implemented and tested.
+*   Streaming (`get_response_stream`) is fully implemented and tested.
+*   `send_message` tool is robust, handles errors correctly, and propagates context/hooks reliably.
+*   Persistence interactions are well-tested and documented with examples.
+*   Comprehensive test suite covers core functionality, edge cases, and error handling.
+*   All `TODO` comments are resolved.
+*   Documentation (`migration_guide.md`, examples, docstrings) is accurate and up-to-date.
+*   Deprecated parameters are handled correctly with warnings and documented.
+*   Tracing strategy is implemented or code removed.
+*   The codebase reflects a stable, well-tested state ready for release or further development.

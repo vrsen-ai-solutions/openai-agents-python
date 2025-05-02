@@ -58,3 +58,9 @@ To proceed with the integration:
 3.  The `SendMessage` tool needs special handling within the execution loop (Task 4/Task 7/Task 15) to trigger the orchestrator logic rather than being treated as a standard function or handoff.
 
 This completes the analysis required for Task 2.
+
+### Required Changes/Refactoring
+
+1.  The `agents.Agent` needs to be extended (Task 5) to include Agency Swarm features (file handling, dual tool support, response methods like `get_response`/`get_response_stream`, potentially validator). The `SendMessage` logic will be baked into these new response methods, intercepting the tool call.
+2.  The `Agency` class design (Task 6) needs to incorporate the `agency_chart` parsing and setup of the `send_message` tool equivalents for permitted agent pairs.
+3.  The `send_message` tool needs special handling within the execution loop (Task 4/Task 7/Task 15/Task 11) to trigger the orchestrator logic rather than being treated as a standard function or handoff.
