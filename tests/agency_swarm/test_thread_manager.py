@@ -13,9 +13,6 @@ def test_thread_manager_initialization():
     assert manager._save_callback is None
 
 
-# TODO: Add tests for get_thread method
-
-
 def test_get_thread_generates_id():
     """Tests that get_thread generates a UUID if no thread_id is provided."""
     manager = ThreadManager()
@@ -89,9 +86,6 @@ def test_get_thread_creates_new_if_load_fails(mocker):
     assert not thread.items  # Should be empty as it's newly created
 
 
-# TODO: Add tests for serialization/deserialization
-
-
 def test_thread_manager_serialization():
     """Tests that ThreadManager with populated threads can be serialized and deserialized."""
     # Note: Callbacks are generally not pickleable, so test without them.
@@ -134,9 +128,6 @@ def test_thread_manager_serialization():
     assert deserialized_thread2.items[0]["content"] == "Hello agent1"
     assert deserialized_thread2.items[1]["role"] == "assistant"
     assert deserialized_thread2.items[1]["content"] == "Hello USER"
-
-
-# TODO: Add tests for error handling and edge cases
 
 
 def test_get_thread_invalid_thread_id_type():

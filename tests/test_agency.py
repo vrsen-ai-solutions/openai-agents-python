@@ -101,9 +101,7 @@ def test_agency_initialization_with_flows(mock_agent_a, mock_agent_b):
     # Verify entry point (A is listed standalone, B is only receiver)
     # According to current logic, both might be entry points
     assert mock_agent_a in agency.entry_points
-    assert mock_agent_b in agency.entry_points  # Adjusting based on current logic
-    # assert mock_agent_b not in agency.entry_points
-    # assert len(agency.entry_points) == 1
+    assert mock_agent_b not in agency.entry_points
 
     # Verify register_subagent was called correctly by _configure_agents
     mock_agent_a.register_subagent.assert_called_once_with(mock_agent_b)
@@ -199,15 +197,11 @@ async def test_agency_get_response_invalid_recipient_warning(mock_agent_a, mock_
     message = "Query for B"
 
     # Mock AgentB response
-    mock_agent_b.get_response.return_value = MagicMock(
-        spec=RunResult, final_output="Response from B"
-    )
+    mock_agent_b.get_response.return_value = MagicMock(spec=RunResult, final_output="Response from B")
 
     with patch("agency_swarm.agency.logger.warning") as mock_warning:
         await agency.get_response(message=message, recipient_agent=mock_agent_b)
-        mock_warning.assert_called_once_with(
-            f"Recipient agent '{mock_agent_b.name}' is not a designated entry point."
-        )
+        mock_warning.assert_called_once_with(f"Recipient agent '{mock_agent_b.name}' is not a designated entry point.")
 
     # Verify AgentB was still called despite the warning
     mock_agent_b.get_response.assert_awaited_once()
@@ -262,9 +256,7 @@ async def test_agency_get_response_stream_with_hooks(mock_agent_a):
     mock_agent_a.get_response_stream.return_value = stream_gen()
 
     # Consume the stream
-    async for _ in agency.get_response_stream(
-        message=message, recipient_agent=mock_agent_a, hooks=user_hooks
-    ):
+    async for _ in agency.get_response_stream(message=message, recipient_agent=mock_agent_a, hooks=user_hooks):
         pass
 
     mock_agent_a.get_response_stream.assert_called_once()
@@ -315,14 +307,10 @@ async def test_agency_stream_completion_calls_get_response_stream(mock_agent_a):
         await asyncio.sleep(0)
 
     # Patch agency.get_response_stream directly here
-    with patch.object(
-        agency, "get_response_stream", return_value=agency_stream_mock()
-    ) as mock_stream_call:
+    with patch.object(agency, "get_response_stream", return_value=agency_stream_mock()) as mock_stream_call:
         # Call the deprecated method and consume stream
         events = []
-        async for event_text in agency.stream_completion(
-            message=message, recipient_agent=mock_agent_a
-        ):
+        async for event_text in agency.stream_completion(message=message, recipient_agent=mock_agent_a):
             events.append(event_text)
 
     assert events == [expected_text]
@@ -330,6 +318,122 @@ async def test_agency_stream_completion_calls_get_response_stream(mock_agent_a):
     call_args, call_kwargs = mock_stream_call.call_args
     assert call_kwargs.get("message") == message
     assert call_kwargs.get("recipient_agent") == mock_agent_a
+
+
+# --- Tests for Agent-to-Agent Communication (Task 21) ---
+
+
+@pytest.mark.asyncio
+async def test_agency_agent_to_agent_communication(mock_agent_a, mock_agent_b):
+    """Test a basic agent-to-agent communication flow (A -> B)."""
+    # Setup: Agent A can send messages to Agent B
+    mock_agent_a.register_subagent(mock_agent_b)
+    # Assume send_message tool is implicitly added or mock its effect
+
+    chart = [
+        mock_agent_a,  # Entry point
+        [mock_agent_a, mock_agent_b],  # Communication flow
+    ]
+    agency = Agency(agency_chart=chart)
+
+    # Mock Agent A's response to simulate it calling send_message to B
+    # We'll mock the *result* of A's run, assuming it internally called B
+    # A more detailed test would mock the send_message tool's on_invoke_tool
+
+    # Simulate the final output coming from B after A called it.
+    final_expected_output = "Response from B after A called it"
+    mock_run_result_a = MagicMock(spec=RunResult)
+    mock_run_result_a.final_output = final_expected_output
+    mock_agent_a.get_response.return_value = mock_run_result_a  # Reset return value for this test
+
+    # Start interaction with Agent A
+    initial_message = "User asks Agent A to talk to Agent B"
+    result = await agency.get_response(message=initial_message, recipient_agent=mock_agent_a)
+
+    # Assertions
+    mock_agent_a.get_response.assert_awaited_once()  # Check A was called initially
+    # In this simplified mock, we assume A's logic internally triggered B.
+    # A deeper test would mock send_message and assert B.get_response was called.
+    # For now, just check the final output reflects the intended flow.
+    assert result.final_output == final_expected_output
+
+
+# --- End of Agent-to-Agent Communication Tests ---
+
+
+# Add a more detailed test mocking the recursive call
+@pytest.mark.asyncio
+async def test_agent_communication_context_hooks_propagation(mock_agent_a, mock_agent_b):
+    """Test context and hooks are propagated during agent communication."""
+    # Setup: A -> B flow, with persistence hooks
+    mock_agent_a.register_subagent(mock_agent_b)
+    mock_load_cb = MagicMock()
+    mock_save_cb = MagicMock()
+    chart = [[mock_agent_a, mock_agent_b]]  # A -> B flow
+    agency = Agency(agency_chart=chart, load_callback=mock_load_cb, save_callback=mock_save_cb)
+    initial_message = "User asks A to trigger B"
+    user_hooks = MagicMock(spec=RunHooks)  # User provided hooks
+
+    # Mock Agent B's get_response directly to inspect call args
+    mock_run_result_b = MagicMock(spec=RunResult)
+    mock_run_result_b.final_output = "B received message from A"
+    mock_agent_b.get_response = AsyncMock(return_value=mock_run_result_b)
+
+    # Mock Agent A's response to simulate it calling send_message to B
+    # This time, we need Agent A's get_response to *trigger* Agent B's mock
+    # We achieve this by having Agent A's mock call Agent B's mock
+    async def mock_a_calls_b(*args, **kwargs):
+        # Simulate A doing some work then calling B
+        # Crucially, it should use the context and hooks passed to it
+        # In a real scenario, send_message would handle this.
+        # Here we manually call B's mock, passing down context/hooks.
+        context_for_b = kwargs.get("context_override")
+        hooks_for_b = kwargs.get("hooks_override")
+        await mock_agent_b.get_response(
+            message="Message from A",
+            sender_name=mock_agent_a.name,
+            context_override=context_for_b,
+            hooks_override=hooks_for_b,
+            chat_id=kwargs.get("chat_id"),  # Propagate chat_id
+        )
+        # Return a final result for A's turn
+        mock_final_result_a = MagicMock(spec=RunResult)
+        mock_final_result_a.final_output = "A finished after calling B"
+        return mock_final_result_a
+
+    mock_agent_a.get_response = AsyncMock(side_effect=mock_a_calls_b)
+
+    # Start interaction with Agent A, providing user hooks
+    await agency.get_response(
+        message=initial_message,
+        recipient_agent=mock_agent_a,
+        hooks=user_hooks,  # Pass user hooks here
+    )
+
+    # --- Assertions ---
+    # 1. Check Agent A was called initially
+    mock_agent_a.get_response.assert_awaited_once()
+    initial_call_args, initial_call_kwargs = mock_agent_a.get_response.call_args
+    assert initial_call_kwargs["message"] == initial_message
+    assert initial_call_kwargs["sender_name"] is None
+    # Hooks passed to A should include agency's persistence hooks and user hooks
+    # (In this mock setup, we assume they are combined before calling A)
+    # For simplicity, check that the combined hooks (represented by hooks_for_b) were received.
+    assert initial_call_kwargs["hooks_override"] == agency.persistence_hooks
+    # Initial context should contain thread_manager and agents map
+    initial_context = initial_call_kwargs["context_override"]
+    assert initial_context is None  # Agency passes None if not provided by user
+
+    # 2. Check Agent B was called by A
+    mock_agent_b.get_response.assert_awaited_once()
+    recursive_call_args, recursive_call_kwargs = mock_agent_b.get_response.call_args
+    assert recursive_call_kwargs["message"] == "Message from A"
+    assert recursive_call_kwargs["sender_name"] == mock_agent_a.name
+    # Crucially, check context and hooks propagation
+    propagated_hooks = recursive_call_kwargs["hooks_override"]
+    assert propagated_hooks == agency.persistence_hooks  # Check persistence hooks are passed down
+    propagated_context = recursive_call_kwargs["context_override"]
+    assert propagated_context is None  # Check context is passed down
 
 
 def test_agency_placeholder():  # Placeholder to keep, remove later

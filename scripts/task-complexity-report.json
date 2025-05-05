@@ -1,243 +1,59 @@
 {
   "meta": {
-    "generatedAt": "2025-05-02T01:07:37.641Z",
-    "tasksAnalyzed": 29,
+    "generatedAt": "2025-05-05T02:26:47.686Z",
+    "tasksAnalyzed": 6,
     "thresholdScore": 5,
     "projectName": "Your Project Name",
-    "usedResearch": false
+    "usedResearch": true
   },
   "complexityAnalysis": [
     {
-      "taskId": 2,
-      "taskTitle": "Define MasterContext dataclass",
-      "complexityScore": 3,
-      "recommendedSubtasks": 4,
-      "expansionPrompt": "Break down the implementation of the MasterContext dataclass into specific subtasks, including file creation, field definition with type hints, docstring documentation, and serialization support.",
-      "reasoning": "This is a relatively straightforward task involving creating a dataclass with defined fields and documentation. The complexity is low as it's primarily structural with clear requirements."
-    },
-    {
-      "taskId": 3,
-      "taskTitle": "Implement ConversationThread class",
-      "complexityScore": 4,
-      "recommendedSubtasks": 5,
-      "expansionPrompt": "Break down the implementation of the ConversationThread class into specific subtasks, including class structure, methods for adding and retrieving conversation items, serialization/deserialization, and comprehensive documentation.",
-      "reasoning": "This task involves creating a class with multiple methods and serialization capabilities. It has moderate complexity due to the need to handle conversation history in a format suitable for LLMs."
-    },
-    {
-      "taskId": 4,
-      "taskTitle": "Implement ThreadManager class",
-      "complexityScore": 5,
-      "recommendedSubtasks": 5,
-      "expansionPrompt": "Break down the implementation of the ThreadManager class into specific subtasks, including class structure, thread creation/retrieval logic, participant name handling, serialization/deserialization, and comprehensive documentation.",
-      "reasoning": "This task builds on the ConversationThread class and adds complexity with thread management, participant name formatting, and dictionary-based storage. It requires careful implementation of the thread retrieval logic."
-    },
-    {
-      "taskId": 5,
-      "taskTitle": "Create base Agent class extending SDK Agent",
-      "complexityScore": 6,
-      "recommendedSubtasks": 6,
-      "expansionPrompt": "Break down the implementation of the base Agent class into specific subtasks, including class inheritance structure, initialization method, subagent management, thread manager integration, type hints, and ensuring proper SDK functionality inheritance.",
-      "reasoning": "This task has higher complexity as it involves extending an existing SDK class with new functionality while maintaining compatibility. It requires understanding of the SDK's Agent class and careful implementation of the extension points."
-    },
-    {
-      "taskId": 6,
-      "taskTitle": "Implement Agent.register_subagent method",
-      "complexityScore": 4,
-      "recommendedSubtasks": 4,
-      "expansionPrompt": "Break down the implementation of the Agent.register_subagent method into specific subtasks, including subagent dictionary management, tool addition logic, validation and error handling, and comprehensive documentation.",
-      "reasoning": "This task is focused on a single method with clear requirements. The complexity comes from handling potential edge cases and ensuring proper tool management."
-    },
-    {
-      "taskId": 7,
-      "taskTitle": "Create send_message FunctionTool",
-      "complexityScore": 7,
-      "recommendedSubtasks": 6,
-      "expansionPrompt": "Break down the implementation of the send_message FunctionTool into specific subtasks, including class structure, schema definition, tool invocation logic, context extraction, agent communication flow, thread logging, and error handling.",
-      "reasoning": "This task has higher complexity as it implements the core inter-agent communication mechanism. It requires careful handling of context, validation, and proper integration with the ThreadManager."
-    },
-    {
-      "taskId": 8,
-      "taskTitle": "Implement Agent file handling methods",
-      "complexityScore": 6,
-      "recommendedSubtasks": 5,
-      "expansionPrompt": "Break down the implementation of Agent file handling methods into specific subtasks, including file storage initialization, file upload functionality, existence checking, FileSearchTool integration, and security/validation measures.",
-      "reasoning": "This task involves file system operations with security implications. The complexity comes from ensuring proper file path handling, integration with vector stores, and error handling."
-    },
-    {
-      "taskId": 9,
-      "taskTitle": "Implement Agent.get_response method",
-      "complexityScore": 7,
-      "recommendedSubtasks": 6,
-      "expansionPrompt": "Break down the implementation of the Agent.get_response method into specific subtasks, including thread retrieval, message handling, context preparation, Runner integration, result processing, and comprehensive error handling.",
-      "reasoning": "This is a core method with high complexity as it integrates multiple components (ThreadManager, Runner) and handles the main agent response flow. It requires careful context management and error handling."
-    },
-    {
-      "taskId": 10,
-      "taskTitle": "Implement Agent.stream method",
-      "complexityScore": 5,
-      "recommendedSubtasks": 4,
-      "expansionPrompt": "Break down the implementation of the Agent.stream method into specific subtasks, including adapting get_response logic for streaming, async/await handling, yield implementation, and error handling for stream interruptions.",
-      "reasoning": "This task builds on the get_response method but adds complexity with streaming and async handling. It's moderately complex due to the need to handle asynchronous streaming properly."
-    },
-    {
-      "taskId": 11,
-      "taskTitle": "Create PersistenceHooks class",
-      "complexityScore": 5,
-      "recommendedSubtasks": 4,
-      "expansionPrompt": "Break down the implementation of the PersistenceHooks class into specific subtasks, including class structure, callback handling in run_start, callback handling in run_end, and comprehensive error handling for persistence operations.",
-      "reasoning": "This task involves extending RunHooks with persistence capabilities. The complexity comes from properly integrating with the SDK's hook system and handling potential errors in the persistence callbacks."
-    },
-    {
-      "taskId": 12,
-      "taskTitle": "Implement Agency class initialization",
-      "complexityScore": 8,
-      "recommendedSubtasks": 7,
-      "expansionPrompt": "Break down the implementation of the Agency class initialization into specific subtasks, including parameter handling, ThreadManager instantiation, agent discovery and registration, communication flow setup, tool injection, shared instructions application, and comprehensive error handling.",
-      "reasoning": "This is one of the most complex tasks as it involves orchestrating multiple components and handling various configuration options. It requires careful implementation of the agent discovery and communication flow setup."
-    },
-    {
-      "taskId": 13,
-      "taskTitle": "Implement Agency.get_response method",
-      "complexityScore": 6,
-      "recommendedSubtasks": 5,
-      "expansionPrompt": "Break down the implementation of the Agency.get_response method into specific subtasks, including recipient validation, context preparation, hooks management, agent invocation, result handling, and comprehensive error handling.",
-      "reasoning": "This task implements the main entry point for user interaction with the agency. The complexity comes from properly handling context, hooks, and ensuring correct agent invocation."
-    },
-    {
       "taskId": 14,
-      "taskTitle": "Implement Agency.stream method",
-      "complexityScore": 5,
-      "recommendedSubtasks": 4,
-      "expansionPrompt": "Break down the implementation of the Agency.stream method into specific subtasks, including adapting get_response logic for streaming, async/await handling, yield implementation, and error handling for stream interruptions.",
-      "reasoning": "Similar to the Agent.stream method, this task adds streaming capabilities to the Agency class. The complexity is moderate due to the need to handle asynchronous streaming properly."
-    },
-    {
-      "taskId": 15,
-      "taskTitle": "Implement backward compatibility methods",
-      "complexityScore": 3,
-      "recommendedSubtasks": 4,
-      "expansionPrompt": "Break down the implementation of backward compatibility methods into specific subtasks, including get_completion wrapper implementation, stream_completion wrapper implementation, deprecation marking, and comprehensive documentation explaining migration paths.",
-      "reasoning": "This is a relatively simple task involving the creation of wrapper methods with deprecation notices. The complexity is low as it primarily involves adapting existing methods."
+      "taskTitle": "Implement Comprehensive Test Suite for Core Features",
+      "complexityScore": 9,
+      "recommendedSubtasks": 6,
+      "expansionPrompt": "Break down the implementation of a comprehensive test suite into subtasks that address: (1) resolving all TODOs in test files, (2) writing tests for each core feature (send_message tool, file handling, streaming, response validation, error handling), (3) designing edge case and error condition tests for each feature, (4) ensuring coverage for all public methods and classes, (5) reviewing and improving test coverage metrics, and (6) documenting test strategies and outcomes.",
+      "reasoning": "This task is highly complex due to the need for thorough coverage of multiple core features, addressing existing TODOs, handling edge cases, and ensuring all public interfaces are tested. It requires coordination, deep understanding of the codebase, and careful planning to avoid gaps in coverage. The breadth and depth of testing, as well as the need for maintainable and reliable tests, contribute to its high complexity."
     },
     {
       "taskId": 16,
-      "taskTitle": "Implement tracing integration",
+      "taskTitle": "Update Example Directory",
       "complexityScore": 6,
       "recommendedSubtasks": 5,
-      "expansionPrompt": "Break down the implementation of tracing integration into specific subtasks, including identifying methods for tracing, implementing @trace decorators, adding span attributes, ensuring context propagation, and comprehensive error handling within traced methods.",
-      "reasoning": "This task requires understanding of the SDK's tracing system and careful integration across multiple methods. The complexity comes from ensuring proper context propagation and span attribute management."
+      "expansionPrompt": "Divide the example directory update into subtasks: (1) review all current examples for outdated patterns, (2) update examples to use the latest SDK-based implementation, (3) remove or refactor deprecated examples, (4) add new examples for recently added features, and (5) ensure all examples are well-documented and demonstrate best practices.",
+      "reasoning": "While this task is moderately complex, it is manageable with a systematic approach. The main challenges are identifying outdated examples, ensuring alignment with the latest SDK, and maintaining high-quality documentation. The need to both update and potentially expand the set of examples adds to the workload but is not as technically demanding as deep code or testing tasks."
     },
     {
       "taskId": 17,
-      "taskTitle": "Clean up legacy code",
-      "complexityScore": 4,
-      "recommendedSubtasks": 4,
-      "expansionPrompt": "Break down the legacy code cleanup into specific subtasks, including identifying deprecated methods/attributes, removing verbose comments, updating docstrings, and ensuring code style consistency across the codebase.",
-      "reasoning": "This task involves code cleanup and refactoring. The complexity is moderate as it requires understanding of the codebase to identify what can be safely removed while maintaining functionality."
+      "taskTitle": "Update Class and Method Documentation",
+      "complexityScore": 7,
+      "recommendedSubtasks": 5,
+      "expansionPrompt": "Break down documentation updates into subtasks: (1) audit all public classes and methods for missing or outdated docstrings, (2) update docstrings to reflect current implementation and API, (3) document all parameters, return values, and exceptions, (4) mark deprecated features and provide migration guidance, and (5) add documentation for persistence model, callback requirements, and file handling conventions.",
+      "reasoning": "Documentation updates require a comprehensive audit and careful attention to detail, especially for a mature or complex codebase. Ensuring accuracy, completeness, and clarity across all public interfaces, as well as documenting new and deprecated features, increases the complexity. The need to provide migration guidance and cover nuanced requirements adds further depth."
     },
     {
       "taskId": 18,
-      "taskTitle": "Create simple example: Two-agent conversation",
-      "complexityScore": 4,
-      "recommendedSubtasks": 4,
-      "expansionPrompt": "Break down the creation of the two-agent conversation example into specific subtasks, including agent definition with appropriate instructions, agency setup with communication flow, demonstration script implementation, and comprehensive documentation with expected outputs.",
-      "reasoning": "This task involves creating a simple example to demonstrate the basic functionality. The complexity is moderate as it requires understanding of the API to create a clear and instructive example."
+      "taskTitle": "Address Technical Debt and TODOs",
+      "complexityScore": 8,
+      "recommendedSubtasks": 6,
+      "expansionPrompt": "Divide the technical debt and TODO review into subtasks: (1) systematically identify all TODO comments in the codebase, (2) address each TODO by implementing improvements or documenting decisions, (3) review code for clarity, efficiency, and error handling improvements, (4) refactor code for maintainability, (5) enforce consistent coding style and patterns, and (6) document all changes and rationale.",
+      "reasoning": "Technical debt tasks are inherently complex due to their open-ended nature and the potential for deep, cross-cutting changes. Addressing TODOs often uncovers further issues, and improving code clarity, efficiency, and maintainability requires a strong understanding of the codebase and best practices. Ensuring consistency and documenting changes adds to the challenge."
     },
     {
       "taskId": 19,
-      "taskTitle": "Create complex example: Multi-agent workflow",
-      "complexityScore": 6,
-      "recommendedSubtasks": 5,
-      "expansionPrompt": "Break down the creation of the multi-agent workflow example into specific subtasks, including defining multiple specialized agents, designing complex communication flows, implementing a multi-step workflow demonstration, creating clear documentation, and adding error handling best practices.",
-      "reasoning": "This task involves creating a more complex example with multiple agents and workflows. The complexity is higher as it requires designing a meaningful multi-agent scenario that demonstrates advanced capabilities."
+      "taskTitle": "Implement or Remove Tracing Strategy",
+      "complexityScore": 5,
+      "recommendedSubtasks": 4,
+      "expansionPrompt": "Break down the tracing strategy task into subtasks: (1) review the current state of tracing and commented-out code, (2) decide on implementing tracing with SDK features or removing it, (3) implement tracing or remove all related code as decided, and (4) document the decision and any changes made.",
+      "reasoning": "This task is less complex as it is primarily a decision-making and cleanup activity. The main challenge is understanding the current tracing implementation and ensuring consistency after changes. Implementation or removal of tracing is straightforward compared to tasks involving deep code or test changes."
     },
     {
       "taskId": 20,
-      "taskTitle": "Create example: File handling with agents",
-      "complexityScore": 5,
-      "recommendedSubtasks": 5,
-      "expansionPrompt": "Break down the creation of the file handling example into specific subtasks, including agent definition with file capabilities, file upload demonstration, file existence checking, FileSearchTool usage, and comprehensive documentation with expected outputs.",
-      "reasoning": "This task involves creating an example focused on file handling capabilities. The complexity is moderate as it requires demonstrating file operations and tool usage in a clear and instructive way."
-    },
-    {
-      "taskId": 21,
-      "taskTitle": "Create example: Custom persistence",
-      "complexityScore": 5,
-      "recommendedSubtasks": 5,
-      "expansionPrompt": "Break down the creation of the custom persistence example into specific subtasks, including implementing file-based persistence callbacks, agency setup with persistence, multi-turn conversation demonstration, alternative persistence backend suggestions, and comprehensive documentation.",
-      "reasoning": "This task involves creating an example focused on persistence capabilities. The complexity is moderate as it requires implementing custom callbacks and demonstrating persistence across multiple turns."
-    },
-    {
-      "taskId": 22,
-      "taskTitle": "Write comprehensive unit tests for Agent class",
-      "complexityScore": 7,
-      "recommendedSubtasks": 6,
-      "expansionPrompt": "Break down the unit testing of the Agent class into specific subtasks, including initialization tests with various parameters, register_subagent method tests, file handling method tests, response method tests, ThreadManager interaction tests, and edge case/error handling tests.",
-      "reasoning": "This task involves creating comprehensive tests for a complex class with multiple methods and dependencies. The complexity is high due to the need to mock dependencies and test various scenarios and edge cases."
-    },
-    {
-      "taskId": 23,
-      "taskTitle": "Write comprehensive unit tests for Agency class",
-      "complexityScore": 7,
-      "recommendedSubtasks": 6,
-      "expansionPrompt": "Break down the unit testing of the Agency class into specific subtasks, including initialization tests with various parameters, response method tests, backward compatibility tests, communication flow tests, persistence hook tests, and edge case/error handling tests.",
-      "reasoning": "Similar to the Agent tests, this task involves creating comprehensive tests for a complex class with multiple methods and dependencies. The complexity is high due to the need to mock dependencies and test various scenarios."
-    },
-    {
-      "taskId": 24,
-      "taskTitle": "Write comprehensive unit tests for ThreadManager",
-      "complexityScore": 5,
-      "recommendedSubtasks": 5,
-      "expansionPrompt": "Break down the unit testing of the ThreadManager class into specific subtasks, including initialization tests, thread retrieval tests with various participant combinations, name sorting tests, serialization tests, and edge case/error handling tests.",
-      "reasoning": "This task involves testing the ThreadManager class which has moderate complexity. The tests need to cover various participant combinations and serialization scenarios."
-    },
-    {
-      "taskId": 25,
-      "taskTitle": "Write comprehensive unit tests for send_message tool",
-      "complexityScore": 6,
-      "recommendedSubtasks": 5,
-      "expansionPrompt": "Break down the unit testing of the send_message tool into specific subtasks, including initialization tests, invocation tests with various parameters, recipient validation tests, agent interaction tests, and error handling tests.",
-      "reasoning": "This task involves testing the send_message tool which has significant complexity due to its interaction with multiple components. The tests need to mock these dependencies and verify correct behavior."
-    },
-    {
-      "taskId": 26,
-      "taskTitle": "Write integration tests for multi-agent communication",
-      "complexityScore": 7,
-      "recommendedSubtasks": 6,
-      "expansionPrompt": "Break down the integration testing of multi-agent communication into specific subtasks, including test setup with multiple agents, basic communication tests, complex multi-hop flow tests, error handling tests, conversation history verification, and streaming response tests.",
-      "reasoning": "This task involves creating integration tests that verify the interaction between multiple components. The complexity is high due to the need to set up realistic scenarios and verify end-to-end behavior."
-    },
-    {
-      "taskId": 27,
-      "taskTitle": "Write integration tests for persistence",
-      "complexityScore": 6,
-      "recommendedSubtasks": 5,
-      "expansionPrompt": "Break down the integration testing of persistence into specific subtasks, including mock callback setup, persistence verification across turns, error handling tests, thread configuration tests, and comprehensive test coverage planning.",
-      "reasoning": "This task involves testing the persistence mechanism with mock callbacks. The complexity is moderate to high due to the need to verify correct behavior across multiple turns and with various configurations."
-    },
-    {
-      "taskId": 28,
-      "taskTitle": "Create migration guide",
-      "complexityScore": 5,
-      "recommendedSubtasks": 5,
-      "expansionPrompt": "Break down the creation of the migration guide into specific subtasks, including architectural differences documentation, step-by-step migration instructions, code example comparisons, backward compatibility usage, and common issues/solutions documentation.",
-      "reasoning": "This task involves creating comprehensive documentation for users migrating from the original Agency Swarm. The complexity is moderate as it requires deep understanding of both versions and clear communication of the differences."
-    },
-    {
-      "taskId": 29,
-      "taskTitle": "Update documentation and README",
-      "complexityScore": 5,
-      "recommendedSubtasks": 5,
-      "expansionPrompt": "Break down the documentation update into specific subtasks, including README overview updates, installation instructions, basic usage examples, API documentation updates, and integration of examples/guides into the documentation.",
-      "reasoning": "This task involves updating various documentation files with the new architecture and usage instructions. The complexity is moderate as it requires comprehensive coverage of the API and clear explanations."
-    },
-    {
-      "taskId": 30,
-      "taskTitle": "Perform final testing and release preparation",
-      "complexityScore": 7,
-      "recommendedSubtasks": 6,
-      "expansionPrompt": "Break down the final testing and release preparation into specific subtasks, including comprehensive test suite execution, coverage analysis and improvement, manual feature testing, version and changelog updates, release branch creation, and package build/verification.",
-      "reasoning": "This task involves final verification and preparation for release. The complexity is high due to the comprehensive nature of the testing required and the importance of ensuring a stable release."
+      "taskTitle": "Final Integration Testing and Release Preparation",
+      "complexityScore": 10,
+      "recommendedSubtasks": 7,
+      "expansionPrompt": "Expand final integration testing and release preparation into subtasks: (1) plan and execute comprehensive integration tests covering all components, (2) test complex scenarios involving multiple features, (3) verify all PRD requirements are met, (4) update version numbers, changelog, and release notes, (5) ensure all documentation is current, (6) address any final issues found during testing, and (7) coordinate release logistics and communication.",
+      "reasoning": "This is the most complex task as it involves validating the entire system, ensuring all features work together, meeting all requirements, and preparing for release. It requires coordination across testing, documentation, and release management, with high stakes for quality and completeness. Any issues found may require rapid fixes and retesting, adding to the challenge."
     }
   ]
 }

@@ -1,7 +1,7 @@
 import logging
 from typing import TYPE_CHECKING
 
-from agents import FunctionTool, RunContextWrapper, RunResult, function_tool
+from agents import FunctionTool, RunContextWrapper, RunResult
 
 from ..context import MasterContext
 
@@ -9,103 +9,135 @@ if TYPE_CHECKING:
     from ..agent import Agent
 
 logger = logging.getLogger(__name__)
-SEND_MESSAGE_TOOL_NAME = "SendMessage"
+
+# Constant for the message parameter name
+MESSAGE_PARAM = "message"
 
 
-# --- Tool Definition using @function_tool --- #
-@function_tool(
-    name_override=SEND_MESSAGE_TOOL_NAME,
-    description_override=(
-        "Send a message to another agent to delegate tasks or share information. "
-        "Use this when you need another agent's expertise or action to proceed."
-    ),
-)
-async def send_message(
-    wrapper: RunContextWrapper[MasterContext],
-    recipient: str,  # Description inferred from docstring
-    message: str,  # Description inferred from docstring
-) -> str:
-    """Sends a message to a specified recipient agent.
-
-    Args:
-        wrapper: The run context wrapper providing access to agent and shared context.
-        recipient: The exact name of the recipient agent that is registered.
-        message: The message content to send to the recipient agent.
+class SendMessage(FunctionTool):
     """
-    # @custom_span("SendMessageTool.on_invoke_tool") # Keep tracing commented out for now
-    master_context: MasterContext = wrapper.context
-    # hooks = wrapper.hooks # Hooks are not available directly in the tool wrapper
+    A dynamically created tool for an agent to send a message to a specific registered recipient agent.
+    """
 
-    # Get current agent name and agency agent map from context
-    current_agent_name = master_context.current_agent_name
-    agency_agents = master_context.agents
+    # Store references to the sender and recipient agents
+    sender_agent: "Agent"
+    recipient_agent: "Agent"
 
-    if not current_agent_name or current_agent_name not in agency_agents:
-        logger.error(f"Could not determine current agent ('{current_agent_name}') from context.")
-        return "Error: Internal configuration error. Could not determine sending agent."
+    def __init__(
+        self,
+        sender_agent: "Agent",
+        recipient_agent: "Agent",
+        tool_name: str,
+        tool_description: str,
+    ):
+        """
+        Initializes the specific send message tool.
 
-    current_agent: Agent = agency_agents[current_agent_name]
+        Args:
+            sender_agent: The agent instance that owns this tool.
+            recipient_agent: The agent instance that this tool communicates with.
+            tool_name: The specific name for this tool (e.g., "send_message_to_RecipientAgent").
+            tool_description: The description for this tool, including context about the recipient.
+        """
+        self.sender_agent = sender_agent
+        self.recipient_agent = recipient_agent
 
-    recipient_name = recipient
-    message_content = message
-    current_chat_id = master_context.chat_id  # Get chat_id from context
+        # Define the JSON schema for the 'message' parameter
+        params_schema = {
+            "type": "object",
+            "properties": {
+                MESSAGE_PARAM: {
+                    "type": "string",
+                    "description": f"The message content to send to the {recipient_agent.name}.",
+                },
+            },
+            "required": [MESSAGE_PARAM],
+            "additionalProperties": False,  # Enforce only the defined parameter
+        }
 
-    logger.info(
-        f"Agent '{current_agent_name}' invoking {SEND_MESSAGE_TOOL_NAME} tool. "
-        f"Recipient: '{recipient_name}', Message: \"{message_content[:50]}...\""
-    )
-
-    # --- Validation (using current_agent instance obtained from context) ---
-    if not hasattr(current_agent, "_subagents"):
-        logger.error(f"Current agent '{current_agent_name}' lacks '_subagents' attribute.")
-        return "Error: Internal configuration error. Agent cannot determine valid recipients."
-
-    if recipient_name not in current_agent._subagents:
-        valid_recipients = ", ".join(current_agent._subagents.keys())
-        logger.warning(
-            f"Invalid recipient '{recipient_name}' specified by agent '{current_agent_name}'. "
-            f"Valid recipients: {valid_recipients}"
+        # Initialize the FunctionTool base class
+        super().__init__(
+            name=tool_name,
+            description=tool_description,
+            params_json_schema=params_schema,
         )
-        return (
-            f"Error: Invalid recipient '{recipient_name}'. Valid recipients are: {valid_recipients}"
+        logger.debug(
+            f"Initialized SendMessage tool: '{self.name}' for sender '{sender_agent.name}' -> recipient '{recipient_agent.name}'"
         )
 
-    # Find target agent in the agency map from context
-    if recipient_name not in agency_agents:
-        logger.error(f"Recipient agent '{recipient_name}' not found in master context agents map.")
-        return f"Error: Recipient agent '{recipient_name}' not found in the agency."
+    async def on_invoke_tool(self, wrapper: RunContextWrapper[MasterContext], **kwargs: str) -> RunResult:
+        """
+        Handles the invocation of this specific send message tool.
 
-    target_agent: Agent = agency_agents[recipient_name]
+        Retrieves the message from kwargs, validates context, calls the recipient agent's
+        get_response method, and returns the text result.
 
-    # --- Call Target Agent --- (Using target_agent.get_response as per PRD)
-    try:
-        logger.debug(f"Calling target agent '{target_agent.name}'.get_response...")
-        # Pass down the master context. Hooks will be handled by the Runner for the sub-call.
-        sub_result: RunResult = await target_agent.get_response(
-            message=message_content,
-            sender_name=current_agent_name,  # Pass name from context
-            chat_id=current_chat_id,  # Pass the current chat_id
-            # Pass only the user_context part as override
-            context_override=master_context.user_context,
-            # hooks_override=hooks, # Don't pass hooks from here
-        )
-        final_output_text = sub_result.final_output or "(No text output from agent)"
+        Args:
+            wrapper: The run context wrapper.
+            **kwargs: Must contain the 'message' parameter.
+
+        Returns:
+            A RunResult containing the response from the recipient agent.
+        """
+        master_context: MasterContext = wrapper.context
+        message_content = kwargs.get(MESSAGE_PARAM)
+
+        if not message_content:
+            logger.error(f"Tool '{self.name}' invoked without '{MESSAGE_PARAM}' parameter.")
+            return RunResult.error(f"Error: Missing required parameter '{MESSAGE_PARAM}' for tool {self.name}.")
+
+        # Get chat_id from context
+        current_chat_id = master_context.chat_id
+        if not current_chat_id:
+            # This should ideally not happen if context is prepared correctly
+            logger.error(f"Tool '{self.name}' invoked without 'chat_id' in MasterContext.")
+            return RunResult.error("Error: Internal context error. Missing chat_id for agent communication.")
+
+        sender_name = self.sender_agent.name
+        recipient_name = self.recipient_agent.name
+
         logger.info(
-            f"Received response from '{target_agent.name}': \"{final_output_text[:50]}...\""
+            f"Agent '{sender_name}' invoking tool '{self.name}'. "
+            f"Recipient: '{recipient_name}', ChatID: {current_chat_id}, "
+            f'Message: "{message_content[:50]}..."'
         )
 
-        # --- Log Communication (Optional but good practice) ---
-        # Logging might be better handled within the Runner or specific hooks.
+        try:
+            # Call the recipient agent's get_response method directly
+            logger.debug(f"Calling target agent '{recipient_name}'.get_response...")
 
-        return final_output_text
+            # --- IMPORTANT ---
+            # Pass the current chat_id and sender_name.
+            # Pass only the user_context part of the master context as context_override.
+            # The Runner within the recipient's get_response will handle history, hooks, etc.
+            sub_run_result: RunResult = await self.recipient_agent.get_response(
+                message=message_content,
+                sender_name=sender_name,
+                chat_id=current_chat_id,
+                context_override=master_context.user_context,  # Pass only user context
+                # Do NOT pass hooks or run_config from here.
+            )
 
-    except Exception as e:
-        logger.error(
-            f"Error occurred during sub-call from '{current_agent_name}' to '{target_agent.name}': {e}",
-            exc_info=True,
-        )
-        return f"Error: Failed to get response from agent '{target_agent.name}'. Reason: {e}"
+            # Extract the final text output for the tool result
+            final_output_text = sub_run_result.final_output or "(No text output from recipient)"
+            logger.info(
+                f"Received response via tool '{self.name}' from '{recipient_name}': \"{final_output_text[:50]}...\""
+            )
+
+            # The tool itself returns a RunResult containing the final output text
+            # The Runner will handle adding this as a ToolCallOutputItem
+            return RunResult.output(final_output_text)
+
+        except Exception as e:
+            logger.error(
+                f"Error occurred during sub-call via tool '{self.name}' from '{sender_name}' to '{recipient_name}': {e}",
+                exc_info=True,
+            )
+            # Return an error RunResult
+            return RunResult.error(f"Error: Failed to get response from agent '{recipient_name}'. Reason: {e}")
 
 
-# --- Export the decorated tool instance --- #
-send_message_tool: FunctionTool = send_message
+# --- Remove the old generic tool export ---
+# send_message_tool: FunctionTool = send_message
+SEND_MESSAGE_TOOL_NAME = None  # Deprecate the old name constant
+send_message_tool = None  # Deprecate the old tool instance

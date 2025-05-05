@@ -124,9 +124,7 @@ class Agency:
 
         # Log if any deprecated args were used
         if deprecated_args_used:
-            logger.warning(
-                f"Deprecated Agency parameters used: {list(deprecated_args_used.keys())}"
-            )
+            logger.warning(f"Deprecated Agency parameters used: {list(deprecated_args_used.keys())}")
         # Warn about any remaining unknown kwargs
         for key in kwargs:
             logger.warning(f"Unknown parameter '{key}' passed to Agency constructor.")
@@ -137,9 +135,7 @@ class Agency:
         self.user_context = user_context or {}
 
         # --- Initialize Core Components (Use potentially mapped callbacks) ---
-        self.thread_manager = ThreadManager(
-            load_callback=final_load_callback, save_callback=final_save_callback
-        )
+        self.thread_manager = ThreadManager(load_callback=final_load_callback, save_callback=final_save_callback)
         self.persistence_hooks = None
         if final_load_callback and final_save_callback:
             self.persistence_hooks = PersistenceHooks(final_load_callback, final_save_callback)
@@ -180,9 +176,7 @@ class Agency:
                 if len(entry) == 2:
                     receiver_agent = entry[1]
                     if not isinstance(receiver_agent, Agent):
-                        raise TypeError(
-                            f"Invalid receiver type in chart entry: {type(receiver_agent)}"
-                        )
+                        raise TypeError(f"Invalid receiver type in chart entry: {type(receiver_agent)}")
                     if id(receiver_agent) not in registered_agent_ids:
                         self._register_agent(receiver_agent)
                         registered_agent_ids.add(id(receiver_agent))
@@ -219,47 +213,65 @@ class Agency:
         self.agents[agent_name] = agent
 
     def _configure_agents(self) -> None:
-        """Injects agency refs, thread manager, shared instructions, and send_message tool."""
+        """Injects agency refs, thread manager, shared instructions, and configures agent communication
+        by calling register_subagent for defined flows.
+        """
         logger.info("Configuring agents...")
+        # Build the communication map from the chart
         communication_map: Dict[str, List[str]] = {agent_name: [] for agent_name in self.agents}
         for entry in self.chart:
             if isinstance(entry, list) and len(entry) == 2:
                 sender, receiver = entry
-                if receiver.name not in communication_map[sender.name]:
-                    communication_map[sender.name].append(receiver.name)
+                # Ensure both are actual Agent instances before accessing name
+                if isinstance(sender, Agent) and isinstance(receiver, Agent):
+                    sender_name = sender.name
+                    receiver_name = receiver.name
+                    if sender_name in communication_map and receiver_name not in communication_map[sender_name]:
+                        communication_map[sender_name].append(receiver_name)
+                else:
+                    logger.warning(f"Invalid agent types found in communication chart entry: {entry}. Skipping.")
 
+        # Configure each agent
         for agent_name, agent_instance in self.agents.items():
-            # Inject Agency and ThreadManager
-            agent_instance._set_agency_instance(self)  # Provides access to self.agents map
+            # Inject Agency reference (for access to full agents map) and ThreadManager
+            agent_instance._set_agency_instance(self)
             agent_instance._set_thread_manager(self.thread_manager)
 
             # Apply shared instructions (prepend)
             if self.shared_instructions:
                 if agent_instance.instructions:
-                    agent_instance.instructions = (
-                        self.shared_instructions + "\n\n---\n\n" + agent_instance.instructions
-                    )
+                    agent_instance.instructions = self.shared_instructions + "\n\n---\n\n" + agent_instance.instructions
                 else:
                     agent_instance.instructions = self.shared_instructions
                 logger.debug(f"Applied shared instructions to agent: {agent_name}")
 
-            # Register subagents based on communication map and add send_message tool
+            # --- Register subagents based on the explicit communication map ---
+            # This will internally create the specific send_message_to_... tools
             allowed_recipients = communication_map.get(agent_name, [])
             if allowed_recipients:
                 logger.debug(f"Agent '{agent_name}' can send messages to: {allowed_recipients}")
                 for recipient_name in allowed_recipients:
                     if recipient_name in self.agents:
-                        # Use register_subagent which also ensures send_message tool
                         recipient_agent = self.agents[recipient_name]
-                        agent_instance.register_subagent(recipient_agent)
+                        try:
+                            # Call the modified register_subagent
+                            agent_instance.register_subagent(recipient_agent)
+                        except Exception as e:
+                            logger.error(
+                                f"Error registering subagent '{recipient_name}' for sender '{agent_name}': {e}",
+                                exc_info=True,
+                            )
                     else:
-                        logger.error(
-                            f"Configuration Error: Agent '{agent_name}' chart allows sending to '{recipient_name}', but agent not found."
+                        # This should not happen if chart parsing is correct
+                        logger.warning(
+                            f"Recipient agent '{recipient_name}' defined in chart for sender '{agent_name}' but not found in registered agents."
                         )
             else:
                 logger.debug(
-                    f"Agent '{agent_name}' has no outgoing communication paths defined in chart."
+                    f"Agent '{agent_name}' has no explicitly defined outgoing communication paths in the chart."
                 )
+
+        logger.info("Agent configuration complete.")
 
     # --- Agency Interaction Methods ---
     async def get_response(
@@ -274,16 +286,12 @@ class Agency:
         """Initiates an interaction with a specified entry point agent."""
         target_agent = self._resolve_agent(recipient_agent)
         if target_agent not in self.entry_points:
-            logger.warning(
-                f"Recipient agent '{target_agent.name}' is not a designated entry point."
-            )
+            logger.warning(f"Recipient agent '{target_agent.name}' is not a designated entry point.")
             # Allow calling non-entry points? Or raise error?
             # Let's allow it for now, but log a warning.
             # raise ValueError(f"Recipient agent '{target_agent.name}' is not a designated entry point.")
 
-        effective_hooks = (
-            hooks_override or self.persistence_hooks
-        )  # Use agency persistence hooks by default
+        effective_hooks = hooks_override or self.persistence_hooks  # Use agency persistence hooks by default
 
         # Create or use provided chat_id
         if not chat_id:
@@ -312,17 +320,13 @@ class Agency:
         """Initiates a streaming interaction with a specified entry point agent."""
         target_agent = self._resolve_agent(recipient_agent)
         if target_agent not in self.entry_points:
-            logger.warning(
-                f"Recipient agent '{target_agent.name}' is not a designated entry point."
-            )
+            logger.warning(f"Recipient agent '{target_agent.name}' is not a designated entry point.")
 
         effective_hooks = hooks_override or self.persistence_hooks
 
         if not chat_id:
             chat_id = f"chat_{uuid.uuid4()}"
-            logger.info(
-                f"Initiating new stream chat with agent '{target_agent.name}', chat_id: {chat_id}"
-            )
+            logger.info(f"Initiating new stream chat with agent '{target_agent.name}', chat_id: {chat_id}")
 
         # Delegate to the target agent's get_response_stream method
         async for event in target_agent.get_response_stream(
@@ -360,21 +364,15 @@ class Agency:
     ) -> str:
         """[DEPRECATED] Use get_response instead. Returns final text output."""
         logger.warning("Method 'get_completion' is deprecated. Use 'get_response' instead.")
-        run_result = await self.get_response(
-            message=message, recipient_agent=recipient_agent, **kwargs
-        )
+        run_result = await self.get_response(message=message, recipient_agent=recipient_agent, **kwargs)
         return run_result.final_output_text or ""
 
     async def stream_completion(
         self, message: str, recipient_agent: Union[str, Agent], **kwargs: Any
     ) -> AsyncGenerator[str, None]:
         """[DEPRECATED] Use get_response_stream instead. Yields text chunks."""
-        logger.warning(
-            "Method 'stream_completion' is deprecated. Use 'get_response_stream' instead."
-        )
-        async for event in self.get_response_stream(
-            message=message, recipient_agent=recipient_agent, **kwargs
-        ):
+        logger.warning("Method 'stream_completion' is deprecated. Use 'get_response_stream' instead.")
+        async for event in self.get_response_stream(message=message, recipient_agent=recipient_agent, **kwargs):
             # Yield only text events for backward compatibility
             if isinstance(event, dict) and event.get("event") == "text":
                 # Check for 'data' field for text events, fallback to 'content' if needed?

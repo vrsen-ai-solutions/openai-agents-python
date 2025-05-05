@@ -4,10 +4,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agency_swarm.agent import Agent, FileSearchTool
+from agency_swarm.agent import SEND_MESSAGE_TOOL_PREFIX, Agent, FileSearchTool
 from agency_swarm.context import MasterContext
 from agency_swarm.thread import ConversationThread, ThreadManager
-from agency_swarm.tools.send_message import SEND_MESSAGE_TOOL_NAME
 from agents import FunctionTool, RunConfig, RunHooks, RunResult
 
 # --- Fixtures ---
@@ -61,8 +60,6 @@ def minimal_agent(mock_thread_manager):
     agent._set_thread_manager(mock_thread_manager)  # Inject mock manager
     return agent
 
-
-# TODO: Add more fixtures as needed (e.g., agent with tools, subagents)
 
 # --- Test Cases ---
 
@@ -137,9 +134,7 @@ def test_agent_does_not_add_filesearch_tool(tmp_path):
     files_dir.mkdir()
 
     with patch("agency_swarm.agent.Agent._ensure_file_search_tool") as mock_ensure_fs_tool:
-        agent = Agent(
-            name="NoFileSearchAgent", instructions="No Search", files_folder=str(files_dir)
-        )
+        agent = Agent(name="NoFileSearchAgent", instructions="No Search", files_folder=str(files_dir))
         mock_ensure_fs_tool.assert_not_called()
         assert agent._associated_vector_store_id is None
         assert not any(isinstance(tool, FileSearchTool) for tool in agent.tools)
@@ -160,40 +155,34 @@ def test_register_subagent(minimal_agent):
 
 def test_register_subagent_adds_send_message_tool(minimal_agent):
     """Test that registering a subagent adds the send_message tool if not present."""
-    assert not any(tool.name == SEND_MESSAGE_TOOL_NAME for tool in minimal_agent.tools)
+    # Initial check: Ensure no send message tool exists yet
+    assert not any(
+        tool.name.startswith(SEND_MESSAGE_TOOL_PREFIX) for tool in minimal_agent.tools if hasattr(tool, "name")
+    )
 
     subagent = Agent(name="SubAgent2", instructions="Needs messaging")
     minimal_agent.register_subagent(subagent)
 
-    # Check if send_message_tool instance is now in tools
-    # Note: The actual tool instance added might be a unique instance generated
-    # by the Agency or Agent, not necessarily the imported send_message_tool itself.
-    # We check by name and potentially type/functionality.
-    send_tool_present = any(
-        hasattr(tool, "name") and tool.name == SEND_MESSAGE_TOOL_NAME
-        for tool in minimal_agent.tools
-    )
+    # Check if the specific send_message tool instance is now in tools
+    expected_tool_name = f"{SEND_MESSAGE_TOOL_PREFIX}{subagent.name}"
+    send_tool_present = any(hasattr(tool, "name") and tool.name == expected_tool_name for tool in minimal_agent.tools)
     assert send_tool_present
-    # Verify the tool added is indeed the send_message function tool
-    added_tool = next(
-        (t for t in minimal_agent.tools if hasattr(t, "name") and t.name == SEND_MESSAGE_TOOL_NAME),
-        None,
-    )
-    assert added_tool is not None
-    # Check if it wraps the correct function (optional, depends on implementation detail)
-    # assert getattr(added_tool, 'func', None) == send_message_tool.func
 
 
+@pytest.mark.asyncio
 def test_register_subagent_idempotent(minimal_agent):
     """Test that registering the same subagent multiple times is idempotent."""
     subagent = Agent(name="SubAgent3", instructions="Register me lots")
+    expected_tool_name = f"{SEND_MESSAGE_TOOL_PREFIX}{subagent.name}"
 
     minimal_agent.register_subagent(subagent)
     initial_tool_count = len(minimal_agent.tools)
+    # Find the dynamically created tool
     send_tool = next(
-        (t for t in minimal_agent.tools if hasattr(t, "name") and t.name == SEND_MESSAGE_TOOL_NAME),
+        (t for t in minimal_agent.tools if hasattr(t, "name") and t.name == expected_tool_name),
         None,
     )
+    assert send_tool is not None  # Ensure the tool was found initially
 
     # Register again
     minimal_agent.register_subagent(subagent)
@@ -202,7 +191,7 @@ def test_register_subagent_idempotent(minimal_agent):
     assert minimal_agent._subagents[subagent.name] == subagent
     # Ensure tool count hasn't increased (no duplicate send_message tool)
     assert len(minimal_agent.tools) == initial_tool_count
-    # Ensure the instance of the tool is the same (optional check)
+    # Ensure the specific tool is still present
     assert send_tool in minimal_agent.tools
 
 
@@ -245,9 +234,7 @@ async def test_check_file_exists_true(mock_openai_client, tmp_path):
     files_dir = tmp_path / vs_folder_name
     # Agent extracts vs_id from folder name
     agent = Agent(name="ExistsAgent", instructions="Test", files_folder=str(files_dir))
-    assert (
-        agent._associated_vector_store_id == vs_id.split("_", 1)[1]
-    )  # Verify VS ID was set (without prefix)
+    assert agent._associated_vector_store_id == vs_id.split("_", 1)[1]  # Verify VS ID was set (without prefix)
 
     filename_to_check = "myfile.txt"
     target_file_id = f"file_{uuid.uuid4()}"
@@ -260,9 +247,7 @@ async def test_check_file_exists_true(mock_openai_client, tmp_path):
 
     # Configure the mock client with the correct nested structure
     mock_client_instance = mock_openai_client.return_value
-    mock_client_instance.beta.vector_stores.files.list.return_value = MagicMock(
-        data=[mock_vs_file_entry]
-    )
+    mock_client_instance.beta.vector_stores.files.list.return_value = MagicMock(data=[mock_vs_file_entry])
     mock_client_instance.files.retrieve.return_value = mock_file_details
 
     # Re-assign the properly configured list mock to the agent's client path
@@ -272,9 +257,7 @@ async def test_check_file_exists_true(mock_openai_client, tmp_path):
     result = await agent.check_file_exists(filename_to_check)
 
     assert result == target_file_id  # Returns the OpenAI file ID if found
-    agent.client.beta.vector_stores.files.list.assert_awaited_once_with(
-        vector_store_id=vs_id, limit=100
-    )
+    agent.client.beta.vector_stores.files.list.assert_awaited_once_with(vector_store_id=vs_id, limit=100)
     agent.client.files.retrieve.assert_awaited_once_with(target_file_id)
 
 
@@ -287,9 +270,7 @@ async def test_check_file_exists_false(mock_openai_client, tmp_path):
     vs_folder_name = f"folder_{vs_id}"
     files_dir = tmp_path / vs_folder_name
     agent = Agent(name="NotExistsAgent", instructions="Test", files_folder=str(files_dir))
-    assert (
-        agent._associated_vector_store_id == vs_id.split("_", 1)[1]
-    )  # Verify VS ID was set (without prefix)
+    assert agent._associated_vector_store_id == vs_id.split("_", 1)[1]  # Verify VS ID was set (without prefix)
 
     filename_to_check = "myfile_not_found.txt"
 
@@ -306,17 +287,13 @@ async def test_check_file_exists_false(mock_openai_client, tmp_path):
     result = await agent.check_file_exists(filename_to_check)
 
     assert result is None  # Returns None if not found
-    agent.client.beta.vector_stores.files.list.assert_awaited_once_with(
-        vector_store_id=vs_id, limit=100
-    )
+    agent.client.beta.vector_stores.files.list.assert_awaited_once_with(vector_store_id=vs_id, limit=100)
 
 
 @pytest.mark.asyncio
 async def test_check_file_exists_no_vs_id():
     """Test check_file_exists returns None if agent has no associated VS ID."""
-    agent = Agent(
-        name="NoVsAgent", instructions="Test", files_folder="some_folder"
-    )  # No VS ID pattern
+    agent = Agent(name="NoVsAgent", instructions="Test", files_folder="some_folder")  # No VS ID pattern
     assert agent._associated_vector_store_id is None
     # Mock the client just in case, although it shouldn't be called
     with patch("openai.AsyncOpenAI") as mock_openai_client:
@@ -430,9 +407,7 @@ async def test_get_response_missing_thread_manager():
 # 5. get_response_stream Tests
 @pytest.mark.asyncio
 @patch("agency_swarm.agent.Runner.run_streamed")  # Use regular patch
-async def test_get_response_stream_basic(
-    mock_runner_run_streamed_patch, minimal_agent, mock_thread_manager
-):
+async def test_get_response_stream_basic(mock_runner_run_streamed_patch, minimal_agent, mock_thread_manager):
     """Test basic call flow of get_response_stream, mocking Runner.run_streamed."""
     mock_events = [
         {"event": "text", "data": "Hello "},
@@ -510,9 +485,7 @@ async def test_get_response_stream_generates_chat_id(
 @pytest.mark.asyncio
 async def test_get_response_stream_requires_chat_id_for_agent_sender(minimal_agent):
     """Test stream raises error if sender is agent but no chat_id."""
-    with pytest.raises(
-        ValueError, match="chat_id is required for agent-to-agent stream communication"
-    ):
+    with pytest.raises(ValueError, match="chat_id is required for agent-to-agent stream communication"):
         async for _ in minimal_agent.get_response_stream("Agent stream", sender_name="OtherAgent"):
             pass
 
@@ -541,9 +514,7 @@ async def test_call_before_agency_setup():
     # Reset agent state if needed for stream test
     agent = Agent(name="PrematureAgentStream", instructions="Test")
     agent._set_thread_manager(mock_tm)
-    with pytest.raises(
-        RuntimeError, match="Cannot prepare context: Agency instance or agents map missing."
-    ):
+    with pytest.raises(RuntimeError, match="Cannot prepare context: Agency instance or agents map missing."):
         async for _ in agent.get_response_stream("Test", chat_id="test"):
             pass
 

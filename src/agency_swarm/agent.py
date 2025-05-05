@@ -13,7 +13,9 @@ from openai import AsyncOpenAI, NotFoundError
 from agents import (
     Agent as BaseAgent,
     FileSearchTool,
+    FunctionTool,
     RunConfig,
+    RunContextWrapper,
     RunHooks,
     RunItem,
     Runner,
@@ -30,7 +32,6 @@ from agents.stream_events import RunItemStreamEvent
 
 from .context import MasterContext
 from .thread import ThreadManager
-from .tools.send_message import SEND_MESSAGE_TOOL_NAME, send_message_tool
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,10 @@ AGENT_PARAMS = {
     "refresh_from_id",
     "mcp_servers",
 }
+
+# --- Constants for dynamic tool creation ---
+SEND_MESSAGE_TOOL_PREFIX = "send_message_to_"
+MESSAGE_PARAM = "message"
 
 
 class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
@@ -152,16 +157,12 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
             if examples and isinstance(examples, list):
                 try:
                     # Basic formatting, might need refinement
-                    examples_str = "\\n\\nExamples:\\n" + "\\n".join(
-                        f"- {json.dumps(ex)}" for ex in examples
-                    )
+                    examples_str = "\\n\\nExamples:\\n" + "\\n".join(f"- {json.dumps(ex)}" for ex in examples)
                     current_instructions = kwargs.get("instructions", "")
                     kwargs["instructions"] = current_instructions + examples_str
                     logger.info("Prepended 'examples' content to agent instructions.")
                 except Exception as e:
-                    logger.warning(
-                        f"Could not automatically prepend 'examples' to instructions: {e}"
-                    )
+                    logger.warning(f"Could not automatically prepend 'examples' to instructions: {e}")
             deprecated_args_used["examples"] = examples  # Store original for logging if needed
         if "file_search" in kwargs:
             warnings.warn(
@@ -191,7 +192,6 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
 
         # --- Separate Kwargs (Existing Logic) ---
         base_agent_params = {}
-        agency_swarm_params = {}  # This name conflicts, rename to avoid confusion
         current_agent_params = {}
         # --- SDK Imports --- (Move BaseAgent signature check here)
         try:
@@ -222,7 +222,7 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
             if key in base_param_names:
                 base_agent_params[key] = value
             # Use the new combined set AGENT_PARAMS for current/swarm-specific params
-            elif key in {"files_folder", "tools_folder", "response_validator"}:
+            elif key in {"files_folder", "tools_folder", "response_validator", "description"}:
                 current_agent_params[key] = value
             else:
                 # Only warn if it wasn't a handled deprecated arg
@@ -230,25 +230,22 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
                     logger.warning(f"Unknown parameter '{key}' passed to Agent constructor.")
 
         # --- BaseAgent Init ---
-        if "description" in kwargs and "description" not in base_agent_params:
-            base_agent_params["description"] = kwargs["description"]
         if "name" not in base_agent_params:
-            # If name wasn't passed explicitly, check if it came from a deprecated 'id' load (though load is removed)
-            # For safety, require name.
             raise ValueError("Agent requires a 'name' parameter.")
         if "tools" not in base_agent_params:
             base_agent_params["tools"] = []
         elif not isinstance(base_agent_params["tools"], list):
             raise TypeError("'tools' parameter must be a list.")
+        # Remove description from base_agent_params if it was added
+        base_agent_params.pop("description", None)
         super().__init__(**base_agent_params)
 
-        # --- Agency Swarm Attrs Init ---
-        # Assign from the filtered current_agent_params dict
+        # --- Agency Swarm Attrs Init --- (Assign AFTER super)
         self.files_folder = current_agent_params.get("files_folder")
-        self.tools_folder = current_agent_params.get(
-            "tools_folder"
-        )  # Used by _load_tools... placeholder
+        self.tools_folder = current_agent_params.get("tools_folder")
         self.response_validator = current_agent_params.get("response_validator")
+        # Set description directly from current_agent_params, default to None if not provided
+        self.description = current_agent_params.get("description")
 
         # --- Internal State Init ---
         self._subagents = {}
@@ -273,11 +270,16 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
         # Simplified: Assumes tool is already a valid Tool instance
         if not isinstance(tool, Tool):
             raise TypeError(f"Expected an instance of agents.Tool, got {type(tool)}")
-        if tool not in self.tools:
-            self.tools.append(tool)
-            logger.debug(
-                f"Tool '{getattr(tool, 'name', '(unknown)')}' added to agent '{self.name}'"
+
+        # Check for existing tool with the same name before adding
+        if any(getattr(t, "name", None) == getattr(tool, "name", None) for t in self.tools):
+            logger.warning(
+                f"Tool with name '{getattr(tool, 'name', '(unknown)')}' already exists for agent '{self.name}'. Skipping."
             )
+            return
+
+        self.tools.append(tool)
+        logger.debug(f"Tool '{getattr(tool, 'name', '(unknown)')}' added to agent '{self.name}'")
 
     def _load_tools_from_folder(self) -> None:
         """Placeholder: Loads tools from tools_folder (future Task)."""
@@ -293,28 +295,137 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
             #     logger.error(f"Error loading tools from folder {self.tools_folder}: {e}")
 
     # --- Subagent Management ---
-    def register_subagent(self, agent: "Agent") -> None:
-        """Registers another agent as a subagent, enabling communication via send_message tool."""
-        if not hasattr(agent, "name") or not isinstance(agent.name, str):
+    def register_subagent(self, recipient_agent: "Agent") -> None:
+        """Registers another agent as a subagent and dynamically creates a specific
+        SendMessage tool for communication.
+        """
+        if not isinstance(recipient_agent, Agent):
+            raise TypeError(
+                f"Expected an instance of Agent, got {type(recipient_agent)}. Ensure agents are initialized before registration."
+            )
+        if not hasattr(recipient_agent, "name") or not isinstance(recipient_agent.name, str):
             raise TypeError("Subagent must be an Agent instance with a valid name.")
-        agent_name = agent.name
-        if agent_name == self.name:
+
+        recipient_name = recipient_agent.name
+        if recipient_name == self.name:
             raise ValueError("Agent cannot register itself as a subagent.")
-        if agent_name in self._subagents:
+
+        # Initialize _subagents if it doesn't exist
+        if not hasattr(self, "_subagents") or self._subagents is None:
+            self._subagents = {}
+
+        if recipient_name in self._subagents:
             logger.warning(
-                f"Agent '{agent_name}' is already registered as a subagent for '{self.name}'. Skipping."
+                f"Agent '{recipient_name}' is already registered as a subagent for '{self.name}'. Skipping tool creation."
             )
             return
 
-        self._subagents[agent_name] = agent
-        logger.info(f"Agent '{self.name}' registered subagent: '{agent_name}'")
-        self._ensure_send_message_tool()
+        self._subagents[recipient_name] = recipient_agent
+        logger.info(f"Agent '{self.name}' registered subagent: '{recipient_name}'")
 
-    def _ensure_send_message_tool(self):
-        """Ensures the functional send_message tool is added to this agent."""
-        if not any(getattr(t, "name", None) == SEND_MESSAGE_TOOL_NAME for t in self.tools):
-            logger.info(f"Adding '{SEND_MESSAGE_TOOL_NAME}' tool to agent '{self.name}'")
-            self.add_tool(send_message_tool)  # Assumes send_message_tool is imported
+        # --- Dynamically create the specific send_message tool --- #
+
+        tool_name = f"{SEND_MESSAGE_TOOL_PREFIX}{recipient_name}"
+        recipient_description = getattr(recipient_agent, "description", "No description provided")
+        tool_description = (
+            f"Send a message to the {recipient_name} agent. " f"This agent's role is: {recipient_description}"
+        )
+
+        # Define the schema for the tool's single parameter: 'message'
+        params_schema = {
+            "type": "object",
+            "properties": {
+                MESSAGE_PARAM: {
+                    "type": "string",
+                    "description": f"The message content to send to the {recipient_name} agent.",
+                }
+            },
+            "required": [MESSAGE_PARAM],
+            "additionalProperties": False,  # Enforce only the message parameter
+        }
+
+        # Define the async function that will handle the tool invocation
+        # This function captures `self` (the sender) and `recipient_agent`
+        async def _invoke_send_message(wrapper: RunContextWrapper[MasterContext], args_str: str) -> str:
+            master_context: MasterContext = wrapper.context
+
+            # Parse the arguments string
+            try:
+                parsed_args = json.loads(args_str)
+                message_content = parsed_args.get(MESSAGE_PARAM)
+            except json.JSONDecodeError:
+                logger.error(f"Tool '{tool_name}' invoked with invalid JSON arguments: {args_str}")
+                return f"Error: Invalid arguments format for tool {tool_name}."
+            except Exception as e:
+                logger.error(
+                    f"Error parsing arguments for tool '{tool_name}': {e}\nArguments: {args_str}", exc_info=True
+                )
+                return f"Error: Could not parse arguments for tool {tool_name}."
+
+            if not message_content:
+                logger.error(f"Tool '{tool_name}' invoked without '{MESSAGE_PARAM}' parameter in arguments: {args_str}")
+                return f"Error: Missing required parameter '{MESSAGE_PARAM}' for tool {tool_name}."
+
+            current_chat_id = master_context.chat_id
+            if not current_chat_id:
+                logger.error(f"Tool '{tool_name}' invoked without 'chat_id' in MasterContext.")
+                return "Error: Internal context error. Missing chat_id for agent communication."
+
+            sender_name = self.name  # Captured from outer scope
+
+            logger.info(
+                f"Agent '{sender_name}' invoking tool '{tool_name}'. "
+                f"Recipient: '{recipient_name}', ChatID: {current_chat_id}, "
+                f'Message: "{message_content[:50]}..."'
+            )
+
+            try:
+                # Call the recipient agent's get_response method directly
+                logger.debug(f"Calling target agent '{recipient_name}'.get_response...")
+                # Store the RunResult object
+                sub_run_result: RunResult = await recipient_agent.get_response(
+                    message=message_content,
+                    sender_name=sender_name,
+                    chat_id=current_chat_id,
+                    context_override=master_context.user_context,  # Pass only user context
+                    # Hooks/Config are managed by the Runner called within get_response
+                )
+
+                # Extract the final text output from the RunResult
+                final_output_text = sub_run_result.final_output or "(No text output from recipient)"
+                # Ensure it's a string before logging/returning
+                if not isinstance(final_output_text, str):
+                    final_output_text = str(final_output_text)
+
+                logger.info(
+                    f"Received response via tool '{tool_name}' from '{recipient_name}': \"{final_output_text[:50]}...\""
+                )
+                # Return the final output text directly as a string
+                return final_output_text
+
+            except Exception as e:
+                logger.error(
+                    f"Error occurred during sub-call via tool '{tool_name}' from '{sender_name}' to '{recipient_name}': {e}",
+                    exc_info=True,
+                )
+                # Return a formatted error string as the tool output
+                # The Runner will package this into a ToolCallOutputItem
+                error_message = f"Error: Failed to get response from agent '{recipient_name}'. Reason: {e}"
+                # Optionally, raise the exception if we want the Runner to handle it more explicitly
+                # raise agents.exceptions.ToolError(error_message) from e
+                return error_message  # Return error string for now
+
+        # Create the FunctionTool instance directly
+        specific_tool = FunctionTool(
+            name=tool_name,
+            description=tool_description,
+            params_json_schema=params_schema,
+            on_invoke_tool=_invoke_send_message,  # Pass the nested function
+        )
+
+        # Add the specific tool to this agent's tools
+        self.add_tool(specific_tool)
+        logger.debug(f"Dynamically added tool '{tool_name}' to agent '{self.name}'.")
 
     # --- File Handling ---
     def _init_file_handling(self) -> None:
@@ -390,17 +501,13 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
         # Upload to OpenAI
         try:
             logger.info(f"Uploading file '{local_upload_path.name}' to OpenAI...")
-            openai_file = await self.client.files.create(
-                file=local_upload_path.open("rb"), purpose="assistants"
-            )
+            openai_file = await self.client.files.create(file=local_upload_path.open("rb"), purpose="assistants")
             logger.info(f"Uploaded to OpenAI. File ID: {openai_file.id}")
 
             # Associate with Vector Store if needed
             if self._associated_vector_store_id:
                 try:
-                    logger.info(
-                        f"Adding OpenAI file {openai_file.id} to VS {self._associated_vector_store_id}"
-                    )
+                    logger.info(f"Adding OpenAI file {openai_file.id} to VS {self._associated_vector_store_id}")
                     # Check if file already exists in VS (optional, API call)
                     # vs_files = await self.client.beta.vector_stores.files.list(vector_store_id=self._associated_vector_store_id, limit=100)
                     # if any(f.id == openai_file.id for f in vs_files.data):
@@ -409,9 +516,7 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
                     await self.client.beta.vector_stores.files.create(
                         vector_store_id=self._associated_vector_store_id, file_id=openai_file.id
                     )
-                    logger.info(
-                        f"Added file {openai_file.id} to VS {self._associated_vector_store_id}."
-                    )
+                    logger.info(f"Added file {openai_file.id} to VS {self._associated_vector_store_id}.")
                     self._ensure_file_search_tool()  # Ensure tool is present after adding first file
                 except NotFoundError:
                     logger.error(
@@ -426,9 +531,7 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
             return openai_file.id
 
         except Exception as e:
-            logger.error(
-                f"Error uploading file {local_upload_path.name} to OpenAI: {e}", exc_info=True
-            )
+            logger.error(f"Error uploading file {local_upload_path.name} to OpenAI: {e}", exc_info=True)
             raise AgentsException(f"Failed to upload file to OpenAI: {e}") from e
 
     async def check_file_exists(self, file_path: str) -> Optional[str]:
@@ -437,9 +540,7 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
             return None
         target_filename = Path(file_path).name
         try:
-            logger.debug(
-                f"Checking for file '{target_filename}' in VS {self._associated_vector_store_id}..."
-            )
+            logger.debug(f"Checking for file '{target_filename}' in VS {self._associated_vector_store_id}...")
             vs_files_page = await self.client.beta.vector_stores.files.list(
                 vector_store_id=self._associated_vector_store_id, limit=100
             )
@@ -455,9 +556,7 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
                     logger.warning(f"Error retrieving details for file {vs_file.id}: {e_inner}")
             return None
         except NotFoundError:
-            logger.error(
-                f"Vector Store {self._associated_vector_store_id} not found during file check."
-            )
+            logger.error(f"Vector Store {self._associated_vector_store_id} not found during file check.")
             return None
         except Exception as e:
             logger.error(
@@ -492,9 +591,7 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
             logger.info(f"New user interaction, generated chat_id: {effective_chat_id}")
         elif sender_name is not None and not effective_chat_id:
             # This case should be prevented by the check below, but handle defensively
-            raise ValueError(
-                "chat_id is required for agent-to-agent communication within get_response."
-            )
+            raise ValueError("chat_id is required for agent-to-agent communication within get_response.")
 
         logger.info(f"Agent '{self.name}' handling get_response for chat_id: {effective_chat_id}")
         thread = self._thread_manager.get_thread(effective_chat_id)
@@ -509,9 +606,7 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
                 thread.add_items(items_to_add)
                 logger.debug(f"Added initial user message to thread {thread.thread_id} before run.")
             except Exception as e:
-                logger.error(
-                    f"Error processing initial input message for get_response: {e}", exc_info=True
-                )
+                logger.error(f"Error processing initial input message for get_response: {e}", exc_info=True)
         # --- END ADDED --- #
 
         # 3. Prepare Context (History is handled internally by Runner now)
@@ -559,16 +654,25 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
             if not self._validate_response(response_text_for_validation):
                 logger.warning(f"Response validation failed for agent '{self.name}'")
 
-        # 7. Add final result items to thread
-        if self._thread_manager and run_result.new_items:
-            thread = self._thread_manager.get_thread(effective_chat_id)
-            items_to_save: List[TResponseInputItem] = []
-            for run_item in run_result.new_items:
-                item_dict = self._run_item_to_tresponse_input_item(run_item)
-                if item_dict:
-                    items_to_save.append(item_dict)
-            if items_to_save:
-                self._thread_manager.add_items_and_save(thread, items_to_save)
+        # 7. Add final result items to thread ONLY if it's a top-level call (from user/agency)
+        if sender_name is None:
+            if self._thread_manager and run_result.new_items:
+                thread = self._thread_manager.get_thread(effective_chat_id)
+                items_to_save: List[TResponseInputItem] = []
+                logger.debug(f"Preparing to save {len(run_result.new_items)} new items to thread {thread.thread_id}")
+                for i, run_item in enumerate(run_result.new_items):
+                    item_dict = self._run_item_to_tresponse_input_item(run_item)
+                    if item_dict:
+                        items_to_save.append(item_dict)
+                        logger.debug(f"  Item {i+1}/{len(run_result.new_items)} converted for saving: {item_dict}")
+                    else:
+                        logger.debug(
+                            f"  Item {i+1}/{len(run_result.new_items)} ({type(run_item).__name__}) skipped or failed conversion."
+                        )
+
+                if items_to_save:
+                    logger.info(f"Saving {len(items_to_save)} converted items to thread {thread.thread_id}")
+                    self._thread_manager.add_items_and_save(thread, items_to_save)
 
         # 8. Return Result
         return run_result
@@ -595,18 +699,14 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
         elif sender_name is not None and not effective_chat_id:
             raise ValueError("chat_id is required for agent-to-agent stream communication.")
 
-        logger.info(
-            f"Agent '{self.name}' handling get_response_stream for chat_id: {effective_chat_id}"
-        )
+        logger.info(f"Agent '{self.name}' handling get_response_stream for chat_id: {effective_chat_id}")
 
         # Add user message to thread *before* starting the run
         # This assumes ThreadManager uses TResponseInputItem dicts now.
         if sender_name is None:
             try:
                 thread = self._thread_manager.get_thread(effective_chat_id)
-                items_to_add = ItemHelpers.input_to_new_input_list(
-                    message
-                )  # Convert string to dict list
+                items_to_add = ItemHelpers.input_to_new_input_list(message)  # Convert string to dict list
                 thread.add_items(items_to_add)
                 self._thread_manager.add_items_and_save(thread, items_to_add)
             except Exception as e:
@@ -641,9 +741,7 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
             logger.info(f"Runner.run_streamed completed for agent '{self.name}'.")
 
         except Exception as e:
-            logger.error(
-                f"Error during Runner.run_streamed for agent '{self.name}': {e}", exc_info=True
-            )
+            logger.error(f"Error during Runner.run_streamed for agent '{self.name}': {e}", exc_info=True)
             # Yield an error event if streaming fails
             yield {"error": f"Runner execution failed: {e}"}
             # Optional: re-raise or handle differently
@@ -694,6 +792,9 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
         if isinstance(item, MessageOutputItem):
             # Extract text content for simplicity; complex content needs more handling
             content = ItemHelpers.text_message_output(item)
+            logger.debug(
+                f"Converting MessageOutputItem to history: role=assistant, content='{content[:50]}...'"
+            )  # DEBUG
             return {"role": "assistant", "content": content}
 
         elif isinstance(item, ToolCallItem):
@@ -707,9 +808,7 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
                 func_args = getattr(item.raw_item, "arguments", None)
 
                 if not call_id or not func_name:
-                    logger.warning(
-                        f"Missing call_id or name in ResponseFunctionToolCall: {item.raw_item}"
-                    )
+                    logger.warning(f"Missing call_id or name in ResponseFunctionToolCall: {item.raw_item}")
                     return None
 
                 # Need to handle potential serialization issues with func_args
@@ -721,6 +820,9 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
                 else:
                     args_str = str(func_args)  # Fallback
 
+                logger.debug(
+                    f"Converting ToolCallItem (Function) to history: id={call_id}, name={func_name}, args='{args_str[:50]}...'"
+                )  # DEBUG
                 tool_calls.append(
                     {
                         "id": call_id,
@@ -729,6 +831,8 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
                     }
                 )
             # Add elif blocks here for other tool call types if needed
+            # elif isinstance(item.raw_item, ResponseComputerToolCall): ...
+            # elif isinstance(item.raw_item, ResponseFileSearchToolCall): ...
             else:
                 logger.warning(f"Unhandled raw_item type in ToolCallItem: {type(item.raw_item)}")
                 return None  # Or handle appropriately
@@ -742,23 +846,24 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
         elif isinstance(item, ToolCallOutputItem):
             # Construct tool call output item
             tool_call_id = None
+            output_content = str(item.output)  # Use the processed output
             # Check structure instead of isinstance for TypedDict
-            if (
-                isinstance(item.raw_item, dict)
-                and item.raw_item.get("type") == "function_call_output"
-            ):
+            if isinstance(item.raw_item, dict) and item.raw_item.get("type") == "function_call_output":
                 tool_call_id = item.raw_item.get("call_id")
+                logger.debug(
+                    f"Converting ToolCallOutputItem (Function) to history: tool_call_id={tool_call_id}, content='{output_content[:50]}...'"
+                )  # DEBUG
+
             # Add similar checks here if handling ComputerCallOutput, etc.
-            # elif isinstance(item.raw_item, dict) and item.raw_item.get('type') == 'computer_call_output': ...
+            # elif isinstance(item.raw_item, dict) and item.raw_item.get('type') == 'computer_call_output':
+            #     tool_call_id = item.raw_item.get("call_id")
+            #     logger.debug(f"Converting ToolCallOutputItem (Computer) to history: tool_call_id={tool_call_id}, content='{output_content[:50]}...'") # DEBUG
 
             if tool_call_id:
                 # Content should be stringified output
-                content = str(item.output)  # Use the processed output
-                return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+                return {"role": "tool", "tool_call_id": tool_call_id, "content": output_content}
             else:
-                logger.warning(
-                    f"Could not determine tool_call_id for ToolCallOutputItem: {item.raw_item}"
-                )
+                logger.warning(f"Could not determine tool_call_id for ToolCallOutputItem: {item.raw_item}")
                 return None
 
         # Add handling for other RunItem types if needed (e.g., HandoffOutputItem?)
@@ -800,9 +905,7 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
                     logger.warning(f"Response validation failed for agent {self.name}")
                 return is_valid
             except Exception as e:
-                logger.error(
-                    f"Error during response validation for agent {self.name}: {e}", exc_info=True
-                )
+                logger.error(f"Error during response validation for agent {self.name}: {e}", exc_info=True)
                 return False  # Treat validation errors as failure
         return True  # No validator means always valid
 
