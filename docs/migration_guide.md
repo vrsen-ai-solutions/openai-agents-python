@@ -194,7 +194,7 @@ Highlight improvements:
 
 ## Common Migration Issues
 
-*   **Tool Conversion:** This is often the most complex part. Focus on mapping `BaseTool` logic to `FunctionTool.on_invoke_tool`.
+*   **Tool Conversion:** This is often the most complex part. Pass your `Tool.run` logic to `FunctionTool.on_invoke_tool`.
 *   **Persistence Logic:** Implementing robust `load_callback`/`save_callback` requires careful state management. Ensure your callbacks match the expected signatures (`load_callback() -> Optional[Dict[str, ConversationThread]]`, `save_callback(Dict[str, ConversationThread])`) used by `PersistenceHooks`. The `load_callback` should load *all* relevant threads for the session/context, and `save_callback` saves the *entire* threads dictionary passed to it. The simplified examples above show the basic structure; real implementations will need more robust error handling and potentially different serialization methods.
 *   **`chat_id` Management:** Your application is responsible for managing the `chat_id` for each distinct conversation. Provide this `chat_id` when calling `agency.get_response` or `agency.get_response_stream` (e.g., for a new user chat, one will be generated automatically like `chat_<uuid>` if none is provided). The `ThreadManager`, used internally, utilizes this `chat_id` (implicitly via thread keys) to manage the loading and saving of the correct conversation history via the `load_callback()` and `save_callback(threads_dict)` functions provided during `Agency` setup.
 *   **API Changes:** Update calls to `Agency` and `Agent` methods, paying attention to deprecated parameters.

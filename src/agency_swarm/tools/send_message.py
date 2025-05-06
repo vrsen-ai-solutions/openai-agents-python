@@ -60,12 +60,13 @@ class SendMessage(FunctionTool):
             name=tool_name,
             description=tool_description,
             params_json_schema=params_schema,
+            on_invoke_tool=self.on_invoke_tool,
         )
         logger.debug(
             f"Initialized SendMessage tool: '{self.name}' for sender '{sender_agent.name}' -> recipient '{recipient_agent.name}'"
         )
 
-    async def on_invoke_tool(self, wrapper: RunContextWrapper[MasterContext], **kwargs: str) -> RunResult:
+    async def on_invoke_tool(self, wrapper: RunContextWrapper[MasterContext], **kwargs: str) -> str:
         """
         Handles the invocation of this specific send message tool.
 
@@ -77,21 +78,23 @@ class SendMessage(FunctionTool):
             **kwargs: Must contain the 'message' parameter.
 
         Returns:
-            A RunResult containing the response from the recipient agent.
+            A string containing the response from the recipient agent.
         """
         master_context: MasterContext = wrapper.context
         message_content = kwargs.get(MESSAGE_PARAM)
 
         if not message_content:
             logger.error(f"Tool '{self.name}' invoked without '{MESSAGE_PARAM}' parameter.")
-            return RunResult.error(f"Error: Missing required parameter '{MESSAGE_PARAM}' for tool {self.name}.")
+            # Return an error string
+            return f"Error: Missing required parameter '{MESSAGE_PARAM}' for tool {self.name}."
 
         # Get chat_id from context
         current_chat_id = master_context.chat_id
         if not current_chat_id:
             # This should ideally not happen if context is prepared correctly
             logger.error(f"Tool '{self.name}' invoked without 'chat_id' in MasterContext.")
-            return RunResult.error("Error: Internal context error. Missing chat_id for agent communication.")
+            # Return an error string
+            return "Error: Internal context error. Missing chat_id for agent communication."
 
         sender_name = self.sender_agent.name
         recipient_name = self.recipient_agent.name
@@ -124,20 +127,19 @@ class SendMessage(FunctionTool):
                 f"Received response via tool '{self.name}' from '{recipient_name}': \"{final_output_text[:50]}...\""
             )
 
-            # The tool itself returns a RunResult containing the final output text
+            # The tool itself returns the raw output text
             # The Runner will handle adding this as a ToolCallOutputItem
-            return RunResult.output(final_output_text)
+            return final_output_text
 
         except Exception as e:
             logger.error(
                 f"Error occurred during sub-call via tool '{self.name}' from '{sender_name}' to '{recipient_name}': {e}",
                 exc_info=True,
             )
-            # Return an error RunResult
-            return RunResult.error(f"Error: Failed to get response from agent '{recipient_name}'. Reason: {e}")
+            # Return an error string
+            return f"Error: Failed to get response from agent '{recipient_name}'. Reason: {e}"
 
 
 # --- Remove the old generic tool export ---
-# send_message_tool: FunctionTool = send_message
-SEND_MESSAGE_TOOL_NAME = None  # Deprecate the old name constant
-send_message_tool = None  # Deprecate the old tool instance
+SEND_MESSAGE_TOOL_NAME = None
+send_message_tool = None

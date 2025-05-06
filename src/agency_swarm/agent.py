@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Union
 
 from openai import AsyncOpenAI, NotFoundError
+from openai.types.responses import ResponseFunctionToolCall
 
 from agents import (
     Agent as BaseAgent,
@@ -26,6 +27,9 @@ from agents import (
 from agents.exceptions import AgentsException
 from agents.items import (
     ItemHelpers,
+    MessageOutputItem,
+    ToolCallItem,
+    ToolCallOutputItem,
 )
 from agents.run import DEFAULT_MAX_TURNS
 from agents.stream_events import RunItemStreamEvent
@@ -63,7 +67,7 @@ SEND_MESSAGE_TOOL_PREFIX = "send_message_to_"
 MESSAGE_PARAM = "message"
 
 
-class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
+class Agent(BaseAgent[MasterContext]):
     """
     Agency Swarm Agent: Extends the base SDK Agent with capabilities for
     multi-agent collaboration within an Agency.
@@ -84,6 +88,9 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
     _associated_vector_store_id: Optional[str] = None
     files_folder_path: Optional[Path] = None
     _subagents: Dict[str, "Agent"]
+
+    # --- SDK Agent Compatibility ---
+    # Re-declare attributes from BaseAgent for clarity and potential overrides
 
     def __init__(self, **kwargs: Any):
         """
@@ -190,10 +197,10 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
         if deprecated_args_used:
             logger.warning(f"Deprecated Agent parameters used: {list(deprecated_args_used.keys())}")
 
-        # --- Separate Kwargs (Existing Logic) ---
+        # --- Separate Kwargs ---
         base_agent_params = {}
         current_agent_params = {}
-        # --- SDK Imports --- (Move BaseAgent signature check here)
+        # --- Get BaseAgent signature ---
         try:
             base_sig = inspect.signature(BaseAgent)
             base_param_names = set(base_sig.parameters.keys())
@@ -255,7 +262,7 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
         self._load_tools_from_folder()  # Placeholder call
         self._init_file_handling()
 
-    # --- Properties --- (Example: OpenAI Client)
+    # --- Properties ---
     @property
     def client(self) -> AsyncOpenAI:
         """Provides access to an initialized AsyncOpenAI client."""
@@ -577,7 +584,6 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
         **kwargs: Any,  # Pass-through to Runner
     ) -> RunResult:
         """Runs the agent's turn using the SDK Runner, returning the full result."""
-        # with custom_span(f"Agent Turn: {self.name}.get_response") as agent_turn_span: # Commented out tracing
         # 1. Validate Prerequisites & Get Thread
         if not self._thread_manager:
             raise RuntimeError(f"Agent '{self.name}' missing ThreadManager.")
@@ -595,19 +601,15 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
 
         logger.info(f"Agent '{self.name}' handling get_response for chat_id: {effective_chat_id}")
         thread = self._thread_manager.get_thread(effective_chat_id)
-        # agent_turn_span.set_attribute("chat_id", chat_id) # Commented out tracing
 
-        # --- ADDED: Add user message to thread before run --- #
+        # Add user message to thread before run
         if sender_name is None:  # Only add if it's initial user input
             try:
                 items_to_add = ItemHelpers.input_to_new_input_list(message)
-                # Add items to the thread object in memory
-                # self._thread_manager.add_items_and_save(thread, items_to_add)
                 thread.add_items(items_to_add)
                 logger.debug(f"Added initial user message to thread {thread.thread_id} before run.")
             except Exception as e:
                 logger.error(f"Error processing initial input message for get_response: {e}", exc_info=True)
-        # --- END ADDED --- #
 
         # 3. Prepare Context (History is handled internally by Runner now)
         # history_for_runner = thread.get_history() # Don't need to get history here
@@ -637,11 +639,9 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
                 else "No final output"
             )
             logger.info(f"Runner.run completed for agent '{self.name}'. {completion_info}")
-            # ... tracing commented out ...
 
         except Exception as e:
             logger.error(f"Error during Runner.run for agent '{self.name}': {e}", exc_info=True)
-            # ... tracing commented out ...
             raise AgentsException(f"Runner execution failed for agent {self.name}") from e
 
         # 6. Optional: Validate Response
@@ -684,49 +684,82 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
         chat_id: Optional[str] = None,
         context_override: Optional[Dict[str, Any]] = None,
         hooks_override: Optional[RunHooks] = None,
-        run_config: Optional[RunConfig] = None,
-        **kwargs: Any,
+        run_config_override: Optional[RunConfig] = None,
+        **kwargs,
     ) -> AsyncGenerator[Any, None]:
-        """Runs the agent's turn using the SDK Runner, yielding stream events."""
-        # ... initial setup and validation ...
+        # --- Early input validation ---
+        if message is None:
+            logger.error("message cannot be None")
+            yield {"type": "error", "content": "message cannot be None"}
+            return
+        if isinstance(message, str) and not message.strip():
+            logger.error("message cannot be empty")
+            yield {"type": "error", "content": "message cannot be empty"}
+            return
+        # --- End input validation ---
+
+        # Ensure internal state is ready
+        if self._thread_manager is None:
+            raise RuntimeError("ThreadManager is not initialized")
+
+        # Determine effective chat_id
+        effective_chat_id: Optional[str] = chat_id
+
+        if effective_chat_id is None:
+            # chat_id was not provided
+            if sender_name is not None:
+                # Agent-to-agent communication requires a chat_id
+                raise ValueError("chat_id is required for agent-to-agent stream communication.")
+            else:
+                # User interaction without a provided chat_id
+                # Generate a new chat ID, do not rely on persisted state
+                effective_chat_id = f"chat_{uuid.uuid4()}"
+                logger.info(f"New user stream interaction, generated chat_id: {effective_chat_id}")
+
         if not self._thread_manager:
-            raise RuntimeError(f"Agent '{self.name}' missing ThreadManager.")
-        # ... other checks ...
-        effective_chat_id = chat_id
-        if sender_name is None and not effective_chat_id:
-            effective_chat_id = f"chat_{uuid.uuid4()}"
-            logger.info(f"New user stream interaction, generated chat_id: {effective_chat_id}")
-        elif sender_name is not None and not effective_chat_id:
-            raise ValueError("chat_id is required for agent-to-agent stream communication.")
+            raise RuntimeError("ThreadManager is not initialized")
+
+        # We should now have a valid effective_chat_id
+        if effective_chat_id is None:
+            # This should be unreachable if logic is correct
+            raise RuntimeError("Internal Error: Failed to determine effective chat_id for stream.")
 
         logger.info(f"Agent '{self.name}' handling get_response_stream for chat_id: {effective_chat_id}")
 
-        # Add user message to thread *before* starting the run
-        # This assumes ThreadManager uses TResponseInputItem dicts now.
+        # Add user message to thread *before* starting the run, only if sender is None (user)
         if sender_name is None:
             try:
                 thread = self._thread_manager.get_thread(effective_chat_id)
                 items_to_add = ItemHelpers.input_to_new_input_list(message)  # Convert string to dict list
-                thread.add_items(items_to_add)
+                # Ensure thread object supports add_items if necessary, or handle via manager
+                # thread.add_items(items_to_add)
                 self._thread_manager.add_items_and_save(thread, items_to_add)
+                logger.debug(f"Added user message to thread {effective_chat_id} before streaming.")
             except Exception as e:
                 logger.error(f"Error processing input message for stream: {e}", exc_info=True)
-                yield {"error": f"Invalid input message format: {e}"}  # Yield error event
+                yield {"type": "error", "content": f"Invalid input message format: {e}"}  # Yield error event
                 return  # Stop the generator
 
-        # history_for_runner = thread.get_history() # Not needed for Runner input
-        master_context = self._prepare_master_context(context_override, effective_chat_id)
-        hooks_to_use = hooks_override or self.hooks
-        effective_run_config = run_config or RunConfig()
-        final_result_items = []  # To capture items for saving at the end
+        # Prepare context, hooks, and config
+        try:
+            master_context = self._prepare_master_context(context_override, effective_chat_id)
+            hooks_to_use = hooks_override or self.hooks
+            effective_run_config = run_config_override or RunConfig()
+        except RuntimeError as e:
+            # Catch errors from _prepare_master_context (e.g., missing agency)
+            logger.error(f"Error preparing context/hooks for stream: {e}", exc_info=True)
+            # Re-raise the critical context preparation error
+            raise e
+            # yield {"type": "error", "content": f"Error preparing context/hooks: {e}"}
+            # return
 
         # Execute via Runner stream
+        final_result_items = []  # To capture items for potential post-processing
         try:
             logger.debug(f"Calling Runner.run_streamed for agent '{self.name}'...")
-            # Use Runner.run_streamed
             async for event in Runner.run_streamed(
                 starting_agent=self,
-                input=message,  # Runner handles adding initial input
+                input=message if sender_name is None else [],  # Runner handles input logic from thread
                 context=master_context,
                 hooks=hooks_to_use,
                 run_config=effective_run_config,
@@ -734,7 +767,7 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
                 previous_response_id=kwargs.get("previous_response_id"),
             ):
                 yield event
-                # Collect RunItems from the stream events if needed for final processing
+                # Collect RunItems from the stream events if needed
                 if isinstance(event, RunItemStreamEvent):
                     final_result_items.append(event.item)
 
@@ -742,59 +775,24 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
 
         except Exception as e:
             logger.error(f"Error during Runner.run_streamed for agent '{self.name}': {e}", exc_info=True)
-            # Yield an error event if streaming fails
-            yield {"error": f"Runner execution failed: {e}"}
-            # Optional: re-raise or handle differently
+            yield {"type": "error", "content": f"Runner execution failed: {e}"}  # Yield error event
             return  # Stop the generator after yielding error
 
-        # 6. Optional: Validate Response (using collected items)
-        response_text_for_validation = ""
-        if final_result_items:
-            response_text_for_validation = ItemHelpers.text_message_outputs(final_result_items)
-
-        if response_text_for_validation and self.response_validator:
-            if not self._validate_response(response_text_for_validation):
-                logger.warning(f"Response validation failed for agent '{self.name}' after stream.")
-
-        # 7. Add final result items to thread (using collected items)
-        if self._thread_manager and final_result_items:
-            thread = self._thread_manager.get_thread(effective_chat_id)
-            items_to_save: List[TResponseInputItem] = []
-            for run_item in final_result_items:
-                item_dict = self._run_item_to_tresponse_input_item(run_item)
-                if item_dict:
-                    items_to_save.append(item_dict)
-            if items_to_save:
-                self._thread_manager.add_items_and_save(thread, items_to_save)
+        # Optional post-streaming actions (like validation, final save) can be added here
+        # if necessary, using final_result_items.
+        # Example: Save final assistant messages/tool calls if required by persistence model
+        # Note: SDK Runner itself handles state within a run via context/hooks.
 
     # --- Helper Methods ---
     def _run_item_to_tresponse_input_item(self, item: RunItem) -> Optional[TResponseInputItem]:
         """Converts a RunItem into the TResponseInputItem dictionary format for history.
         Returns None if the item type shouldn't be added to history directly.
         """
-        # Import necessary types locally within the function if needed, or ensure they are available
-        # Adjust imports based on SDK structure
-        from openai.types.responses import (
-            ResponseComputerToolCall,
-            ResponseFileSearchToolCall,
-            ResponseFunctionToolCall,
-            ResponseFunctionWebSearch,  # Removed FunctionCallOutput, ComputerCallOutput here
-        )
-
-        # Import nested types from correct location
-        from openai.types.responses.response_input_item_param import (
-            ComputerCallOutput,
-            FunctionCallOutput,
-        )
-
-        from agents.items import ItemHelpers, MessageOutputItem, ToolCallItem, ToolCallOutputItem
 
         if isinstance(item, MessageOutputItem):
             # Extract text content for simplicity; complex content needs more handling
             content = ItemHelpers.text_message_output(item)
-            logger.debug(
-                f"Converting MessageOutputItem to history: role=assistant, content='{content[:50]}...'"
-            )  # DEBUG
+            logger.debug(f"Converting MessageOutputItem to history: role=assistant, content='{content[:50]}...'")
             return {"role": "assistant", "content": content}
 
         elif isinstance(item, ToolCallItem):
@@ -822,7 +820,7 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
 
                 logger.debug(
                     f"Converting ToolCallItem (Function) to history: id={call_id}, name={func_name}, args='{args_str[:50]}...'"
-                )  # DEBUG
+                )
                 tool_calls.append(
                     {
                         "id": call_id,
@@ -852,12 +850,12 @@ class Agent(BaseAgent[MasterContext]):  # Context type is MasterContext
                 tool_call_id = item.raw_item.get("call_id")
                 logger.debug(
                     f"Converting ToolCallOutputItem (Function) to history: tool_call_id={tool_call_id}, content='{output_content[:50]}...'"
-                )  # DEBUG
+                )
 
             # Add similar checks here if handling ComputerCallOutput, etc.
             # elif isinstance(item.raw_item, dict) and item.raw_item.get('type') == 'computer_call_output':
             #     tool_call_id = item.raw_item.get("call_id")
-            #     logger.debug(f"Converting ToolCallOutputItem (Computer) to history: tool_call_id={tool_call_id}, content='{output_content[:50]}...'") # DEBUG
+            #     logger.debug(f"Converting ToolCallOutputItem (Computer) to history: tool_call_id={tool_call_id}, content='{output_content[:50]}...'")
 
             if tool_call_id:
                 # Content should be stringified output
