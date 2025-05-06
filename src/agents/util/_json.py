@@ -13,17 +13,9 @@ T = TypeVar("T")
 
 
 def validate_json(json_str: str, type_adapter: TypeAdapter[T], partial: bool) -> T:
-    partial_setting: bool | Literal["off", "on", "trailing-strings"] = (
-        "trailing-strings" if partial else False
-    )
+    partial_setting = "trailing-strings" if partial else False
     try:
-        try:
-            validated = type_adapter.validate_json(
-                json_str, experimental_allow_partial=partial_setting
-            )
-        except TypeError:
-            # For older/newer pydantic versions where this kwarg is not supported
-            validated = type_adapter.validate_json(json_str)
+        validated = type_adapter.validate_json(json_str, experimental_allow_partial=partial_setting)
         return validated
     except ValidationError as e:
         attach_error_to_current_span(
@@ -32,6 +24,4 @@ def validate_json(json_str: str, type_adapter: TypeAdapter[T], partial: bool) ->
                 data={},
             )
         )
-        raise ModelBehaviorError(
-            f"Invalid JSON when parsing {json_str} for {type_adapter}; {e}"
-        ) from e
+        raise ModelBehaviorError(f"Invalid JSON when parsing {json_str} for {type_adapter}; {e}") from e
