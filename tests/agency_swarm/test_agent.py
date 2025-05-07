@@ -8,7 +8,7 @@ from pydantic import BaseModel, ValidationError
 from agency_swarm.agent import SEND_MESSAGE_TOOL_PREFIX, Agent, FileSearchTool
 from agency_swarm.context import MasterContext
 from agency_swarm.thread import ConversationThread, ThreadManager
-from agents import FunctionTool, RunConfig, RunResult
+from agents import FunctionTool, RunConfig, RunContextWrapper, RunResult
 from agents.lifecycle import RunHooks
 
 # --- Fixtures ---
@@ -229,7 +229,6 @@ async def test_check_file_exists_true(mock_openai_client, tmp_path):
     filename_to_check = "myfile.txt"
     target_file_id = f"file_{uuid.uuid4()}"
 
-    mock_vs_files_list = AsyncMock()
     mock_vs_file_entry = MagicMock(id=target_file_id)
     mock_file_details = MagicMock(id=target_file_id, filename=filename_to_check)
 
@@ -709,6 +708,7 @@ def test_validate_response_pydantic_invalid():
 async def test_get_response_integrates_validation_pass(mock_agent):
     mock_agent.response_validator = validator_true
     # Provide minimal required args for mock RunResult
+    mock_context_wrapper = MagicMock(spec=RunContextWrapper)
     mock_run_result = RunResult(
         _last_agent=mock_agent,  # Use the mock_agent fixture
         input=[],
@@ -717,21 +717,21 @@ async def test_get_response_integrates_validation_pass(mock_agent):
         input_guardrail_results=[],
         output_guardrail_results=[],
         final_output="Valid Output",
+        context_wrapper=mock_context_wrapper,
     )
-    # Patch the Runner.run class method where it's called from
-    with patch(
-        "agency_swarm.agent.Runner.run", new_callable=AsyncMock, return_value=mock_run_result
-    ) as patched_runner_run:
+    # Mock the runner's run method to return the predefined RunResult
+    with patch("agency_swarm.agent.Runner.run", new_callable=AsyncMock, return_value=mock_run_result) as mock_run:
         result = await mock_agent.get_response("test message")
 
     assert result.final_output == "Valid Output"
-    patched_runner_run.assert_awaited_once()  # Verify runner.run was actually called
+    mock_run.assert_awaited_once()  # Verify runner.run was actually called
 
 
 @pytest.mark.asyncio
 async def test_get_response_integrates_validation_fail(mock_agent):
     mock_agent.response_validator = validator_false
     # Provide minimal required args for mock RunResult
+    mock_context_wrapper = MagicMock(spec=RunContextWrapper)
     mock_run_result = RunResult(
         _last_agent=mock_agent,
         input=[],
@@ -740,11 +740,11 @@ async def test_get_response_integrates_validation_fail(mock_agent):
         input_guardrail_results=[],
         output_guardrail_results=[],
         final_output="Invalid Output",  # Runner would produce this before validation hook stops it
+        context_wrapper=mock_context_wrapper,
     )
-    # Patch the Runner.run class method
-    with patch(
-        "agency_swarm.agent.Runner.run", new_callable=AsyncMock, return_value=mock_run_result
-    ) as patched_runner_run:
+
+    # Mock the runner's run method to return the predefined RunResult
+    with patch("agency_swarm.agent.Runner.run", new_callable=AsyncMock, return_value=mock_run_result) as mock_run:
         # In a real scenario, a RunHook would likely intercept the 'Invalid Output'
         # and raise an error or modify the result based on the validator returning False.
         # Since we are only mocking runner.run here and not the full hook system,
@@ -754,13 +754,14 @@ async def test_get_response_integrates_validation_fail(mock_agent):
         result = await mock_agent.get_response("test message")
 
     assert result.final_output == "Invalid Output"  # Check runner result passed through
-    patched_runner_run.assert_awaited_once()
+    mock_run.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_get_response_integrates_validation_raise(mock_agent):
     mock_agent.response_validator = validator_raises
     # Provide minimal required args for mock RunResult
+    mock_context_wrapper = MagicMock(spec=RunContextWrapper)
     mock_run_result = RunResult(
         _last_agent=mock_agent,
         input=[],
@@ -769,18 +770,18 @@ async def test_get_response_integrates_validation_raise(mock_agent):
         input_guardrail_results=[],
         output_guardrail_results=[],
         final_output="Output That Fails",  # Runner produces this
+        context_wrapper=mock_context_wrapper,
     )
-    # Patch the Runner.run class method
-    with patch(
-        "agency_swarm.agent.Runner.run", new_callable=AsyncMock, return_value=mock_run_result
-    ) as patched_runner_run:
+
+    # Mock the runner's run method to return the predefined RunResult
+    with patch("agency_swarm.agent.Runner.run", new_callable=AsyncMock, return_value=mock_run_result) as mock_run:
         # Similar to the 'False' case, _validate_response catches the validator's exception.
         # A RunHook would need to act on this validation failure.
         # We expect the mocked result to pass through in this simplified test.
         result = await mock_agent.get_response("test message")
 
     assert result.final_output == "Output That Fails"
-    patched_runner_run.assert_awaited_once()
+    mock_run.assert_awaited_once()
 
 
 # Clean up remaining TODOs

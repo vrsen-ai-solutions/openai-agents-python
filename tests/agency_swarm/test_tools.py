@@ -19,7 +19,7 @@ def mock_sender_agent():
 
 
 @pytest.fixture
-def mock_recipient_agent():
+def mock_recipient_agent(mock_run_context_wrapper):
     agent = MagicMock(spec=Agent)
     agent.name = "RecipientAgent"
     # Provide minimal required args for RunResult
@@ -31,6 +31,7 @@ def mock_recipient_agent():
         input_guardrail_results=[],
         output_guardrail_results=[],
         final_output="Response from recipient",
+        context_wrapper=mock_run_context_wrapper,
     )
     agent.get_response = AsyncMock(return_value=mock_run_result)
     return agent
